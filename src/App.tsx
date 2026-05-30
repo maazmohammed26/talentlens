@@ -973,6 +973,8 @@ type PdfLine = {
   color?: string
   indent?: number
   gap?: number
+  tableCells?: string[]
+  tableHeader?: boolean
 }
 
 function escapePdfText(value: string) {
@@ -983,12 +985,17 @@ function escapePdfText(value: string) {
     .replace(/\)/g, '\\)')
 }
 
+function getPdfLineHeight(line: PdfLine) {
+  if (line.tableCells) return line.tableHeader ? 22 : 46
+  return line.gap ?? (line.size && line.size > 13 ? 20 : 14)
+}
+
 function buildReportPages(lines: PdfLine[]) {
   const pages: PdfLine[][] = []
   let page: PdfLine[] = []
   let y = 730
   lines.forEach((line) => {
-    const gap = line.gap ?? (line.size && line.size > 13 ? 20 : 14)
+    const gap = getPdfLineHeight(line)
     if (y - gap < 64 && page.length) {
       pages.push(page)
       page = []
@@ -1005,6 +1012,45 @@ function pdfText(text: string, x: number, y: number, size = 10, font = 'F1', col
   return `BT ${color} /${font} ${size} Tf ${x} ${y} Td (${escapePdfText(text)}) Tj ET`
 }
 
+function pdfRect(x: number, y: number, width: number, height: number, fill = '1 1 1 rg') {
+  return `q ${fill} ${x} ${y} ${width} ${height} re f Q`
+}
+
+function pdfStrokeRect(x: number, y: number, width: number, height: number, color = '0.78 0.78 0.84 RG') {
+  return `q ${color} 0.5 w ${x} ${y} ${width} ${height} re S Q`
+}
+
+function pdfStrokeLine(x1: number, y1: number, x2: number, y2: number, color = '0.78 0.78 0.84 RG') {
+  return `q ${color} 0.5 w ${x1} ${y1} m ${x2} ${y2} l S Q`
+}
+
+function fitCellLines(value: string, width: number, maxLines: number) {
+  const lines = wrapPdfLine(value || '-', Math.max(8, Math.floor(width / 4.4)))
+  const clipped = lines.slice(0, maxLines)
+  if (lines.length > maxLines && clipped.length) clipped[clipped.length - 1] = `${clipped[clipped.length - 1].slice(0, -3)}...`
+  return clipped
+}
+
+function renderPdfTableRow(cells: string[], y: number, isHeader = false) {
+  const x = 42
+  const widths = [34, 118, 48, 74, 72, 182]
+  const height = isHeader ? 22 : 46
+  const commands = [
+    pdfRect(x, y - height, 528, height, isHeader ? '0.17 0.14 0.45 rg' : '0.98 0.98 1 rg'),
+    pdfStrokeRect(x, y - height, 528, height),
+  ]
+  let currentX = x
+  widths.forEach((width, index) => {
+    if (index > 0) commands.push(pdfStrokeLine(currentX, y, currentX, y - height))
+    const textLines = fitCellLines(cells[index] || '', width - 8, isHeader ? 1 : 3)
+    textLines.forEach((line, lineIndex) => {
+      commands.push(pdfText(line, currentX + 4, y - 14 - lineIndex * 11, isHeader ? 8 : 7.6, isHeader ? 'F2' : 'F1', isHeader ? '1 1 1 rg' : '0.04 0.05 0.16 rg'))
+    })
+    currentX += width
+  })
+  return commands.join('\n')
+}
+
 function renderReportPage(lines: PdfLine[], pageNumber: number, totalPages: number) {
   let y = 730
   const commands = [
@@ -1014,10 +1060,15 @@ function renderReportPage(lines: PdfLine[], pageNumber: number, totalPages: numb
     pdfText(`Page ${pageNumber} of ${totalPages}`, 500, 764, 9, 'F1', '0.35 0.35 0.35 rg'),
   ]
   lines.forEach((line) => {
+    if (line.tableCells) {
+      commands.push(renderPdfTableRow(line.tableCells, y, line.tableHeader))
+      y -= getPdfLineHeight(line)
+      return
+    }
     const size = line.size ?? 10
     const font = line.bold ? 'F2' : 'F1'
     commands.push(pdfText(line.text, 42 + (line.indent ?? 0), y, size, font, line.color ?? '0.04 0.05 0.16 rg'))
-    y -= line.gap ?? (size > 13 ? 20 : 14)
+    y -= getPdfLineHeight(line)
   })
   commands.push('0.17 0.14 0.45 rg 42 42 528 1 re f')
   commands.push(pdfText('Confidential recruiter report. AI assists human judgment; final hiring decisions remain with the recruiter.', 42, 28, 8, 'F1', '0.35 0.35 0.35 rg'))
@@ -1092,18 +1143,35 @@ function buildRankedReportLines(options: RankedReportOptions): PdfLine[] {
     { text: `Experience target: ${roleProfile.minimumYears ? `${roleProfile.minimumYears}+ years` : 'Not specified'}`, gap: 18 },
     { text: 'Status summary', size: 13, bold: true, color: '0.17 0.14 0.45 rg' },
     { text: Object.entries(counts).map(([status, count]) => `${status}: ${count}`).join(' | ') || 'No statuses available', gap: 18 },
-    { text: 'Candidate decisions', size: 13, bold: true, color: '0.17 0.14 0.45 rg' },
+    { text: 'Candidate decision table', size: 13, bold: true, color: '0.17 0.14 0.45 rg' },
+    { text: '', tableHeader: true, tableCells: ['Rank', 'Candidate', 'Score', 'Status', 'Applied', 'HR comment'] },
     ...candidates.flatMap((candidate) => {
       const application = getCandidateApplicationSnapshot(candidate, applications).current
       const status = application?.currentStatus || candidate.status
       const hrComment = application?.hrComment || 'No HR comment recorded.'
       const appliedAt = application ? formatDate(application.lastAppliedAt) : 'No application date'
       return [
-        { text: `#${candidate.rank} ${candidate.name} | ${candidate.email}`, bold: true, gap: 13 },
-        { text: `Status: ${status} | Final: ${candidate.finalScore}/100 | Semantic: ${candidate.semanticScore} | Skill: ${candidate.skillScore} | Experience: ${candidate.experienceScore} | Behavior: ${candidate.behaviorScore}`, indent: 10 },
-        { text: `Applied: ${appliedAt} | Matched skills: ${candidate.matchedSkills.join(', ') || 'None'} | Missing: ${candidate.missingSkills.join(', ') || 'None'}`, indent: 10 },
+        {
+          text: '',
+          tableCells: [
+            `#${candidate.rank}`,
+            `${candidate.name} | ${candidate.email}`,
+            `${candidate.finalScore}/100 S:${candidate.semanticScore} K:${candidate.skillScore} E:${candidate.experienceScore}`,
+            status,
+            appliedAt,
+            hrComment,
+          ],
+        },
+      ] satisfies PdfLine[]
+    }),
+    { text: 'Candidate evidence notes', size: 13, bold: true, color: '0.17 0.14 0.45 rg', gap: 18 },
+    ...candidates.flatMap((candidate) => {
+      const application = getCandidateApplicationSnapshot(candidate, applications).current
+      const status = application?.currentStatus || candidate.status
+      return [
+        { text: `#${candidate.rank} ${candidate.name} - ${status}`, bold: true, gap: 13 },
+        { text: `Matched: ${candidate.matchedSkills.join(', ') || 'None'} | Missing: ${candidate.missingSkills.join(', ') || 'None'}`, indent: 10 },
         ...wrapPdfLine(`AI explanation: ${candidate.reason}`, 92).map((line) => ({ text: line, indent: 10 })),
-        ...wrapPdfLine(`HR comment: ${hrComment}`, 92).map((line, index) => ({ text: line, indent: 10, gap: index === 0 ? 13 : 12 })),
         { text: ' ', gap: 6 },
       ] satisfies PdfLine[]
     }),
