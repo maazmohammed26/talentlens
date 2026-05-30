@@ -164,6 +164,19 @@ type CandidateProfile = {
   location: string
 }
 
+type RankedReportOptions = {
+  candidates: Candidate[]
+  applications: ApplicationRecord[]
+  roleProfile: RoleProfile
+  companyProfile: CompanyProfile
+  statusFilter: string
+  filters: {
+    minimumScore: string
+    skills: string
+    experience: string
+  }
+}
+
 const storageKeys = {
   candidates: 'talentlens:v2:candidates',
   jds: 'talentlens:v2:jds',
@@ -932,7 +945,11 @@ function candidateCsv(candidates: Candidate[]) {
   )
 }
 
-function wrapPdfLine(value: string, maxLength = 82) {
+function getDisplayStatus(candidate: Candidate, applications: ApplicationRecord[]) {
+  return getCandidateApplicationSnapshot(candidate, applications).current?.currentStatus || candidate.status
+}
+
+function wrapPdfLine(value: string, maxLength = 86) {
   const words = value.replace(/\s+/g, ' ').trim().split(' ')
   const lines: string[] = []
   let current = ''
@@ -949,6 +966,15 @@ function wrapPdfLine(value: string, maxLength = 82) {
   return lines
 }
 
+type PdfLine = {
+  text: string
+  size?: number
+  bold?: boolean
+  color?: string
+  indent?: number
+  gap?: number
+}
+
 function escapePdfText(value: string) {
   return value
     .replace(/[^\x20-\x7E]/g, ' ')
@@ -957,25 +983,64 @@ function escapePdfText(value: string) {
     .replace(/\)/g, '\\)')
 }
 
-function buildSimplePdf(title: string, lines: string[]) {
-  const wrappedLines = lines.flatMap((line) => wrapPdfLine(line)).slice(0, 34)
-  const content = [
-    'BT',
-    '/F1 18 Tf',
-    '50 760 Td',
-    `(${escapePdfText(title)}) Tj`,
-    '/F1 10 Tf',
-    '0 -28 Td',
-    ...wrappedLines.flatMap((line) => [`(${escapePdfText(line)}) Tj`, '0 -16 Td']),
-    'ET',
-  ].join('\n')
-  const objects = [
-    '<< /Type /Catalog /Pages 2 0 R >>',
-    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
-    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
-    `<< /Length ${content.length} >>\nstream\n${content}\nendstream`,
+function buildReportPages(lines: PdfLine[]) {
+  const pages: PdfLine[][] = []
+  let page: PdfLine[] = []
+  let y = 730
+  lines.forEach((line) => {
+    const gap = line.gap ?? (line.size && line.size > 13 ? 20 : 14)
+    if (y - gap < 64 && page.length) {
+      pages.push(page)
+      page = []
+      y = 730
+    }
+    page.push(line)
+    y -= gap
+  })
+  if (page.length) pages.push(page)
+  return pages.length ? pages : [[{ text: 'No report data available.' }]]
+}
+
+function pdfText(text: string, x: number, y: number, size = 10, font = 'F1', color = '0 0 0 rg') {
+  return `BT ${color} /${font} ${size} Tf ${x} ${y} Td (${escapePdfText(text)}) Tj ET`
+}
+
+function renderReportPage(lines: PdfLine[], pageNumber: number, totalPages: number) {
+  let y = 730
+  const commands = [
+    'q 0.92 0.92 0.92 rg BT /F2 42 Tf 142 410 Td (TalentLens AI) Tj ET Q',
+    '0.17 0.14 0.45 rg 42 756 528 1 re f',
+    pdfText('TalentLens AI', 42, 764, 9, 'F2', '0.17 0.14 0.45 rg'),
+    pdfText(`Page ${pageNumber} of ${totalPages}`, 500, 764, 9, 'F1', '0.35 0.35 0.35 rg'),
   ]
+  lines.forEach((line) => {
+    const size = line.size ?? 10
+    const font = line.bold ? 'F2' : 'F1'
+    commands.push(pdfText(line.text, 42 + (line.indent ?? 0), y, size, font, line.color ?? '0.04 0.05 0.16 rg'))
+    y -= line.gap ?? (size > 13 ? 20 : 14)
+  })
+  commands.push('0.17 0.14 0.45 rg 42 42 528 1 re f')
+  commands.push(pdfText('Confidential recruiter report. AI assists human judgment; final hiring decisions remain with the recruiter.', 42, 28, 8, 'F1', '0.35 0.35 0.35 rg'))
+  return commands.join('\n')
+}
+
+function buildPdfDocument(lines: PdfLine[]) {
+  const pageLines = buildReportPages(lines)
+  const pageCount = pageLines.length
+  const pageObjectIds = pageLines.map((_, index) => 5 + index * 2)
+  const objects: string[] = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    `<< /Type /Pages /Kids [${pageObjectIds.map((id) => `${id} 0 R`).join(' ')}] /Count ${pageObjectIds.length} >>`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>',
+  ]
+  pageLines.forEach((linesForPage, index) => {
+    const pageObjectId = pageObjectIds[index]
+    const contentObjectId = pageObjectId + 1
+    const content = renderReportPage(linesForPage, index + 1, pageCount)
+    objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${contentObjectId} 0 R >>`)
+    objects.push(`<< /Length ${content.length} >>\nstream\n${content}\nendstream`)
+  })
   let pdf = '%PDF-1.4\n'
   const offsets = [0]
   objects.forEach((object, index) => {
@@ -991,23 +1056,79 @@ function buildSimplePdf(title: string, lines: string[]) {
   return pdf
 }
 
-function rankedReportLines(candidates: Candidate[]) {
+function reportStatusCounts(candidates: Candidate[], applications: ApplicationRecord[]) {
+  return candidates.reduce<Record<string, number>>((counts, candidate) => {
+    const status = getDisplayStatus(candidate, applications)
+    counts[status] = (counts[status] || 0) + 1
+    return counts
+  }, {})
+}
+
+function buildRankedReportLines(options: RankedReportOptions): PdfLine[] {
+  const { candidates, applications, roleProfile, companyProfile, statusFilter, filters } = options
+  const generatedAt = new Intl.DateTimeFormat('en-IN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date())
+  const counts = reportStatusCounts(candidates, applications)
   if (!candidates.length) {
     return [
-      'TalentLens AI ranked output report sample.',
-      'This PDF is a recruiter-facing summary document generated after ranking.',
-      'Upload candidate CSV/JSON first, run ranking, then download the live report from the AI Ranking page.',
+      { text: 'TalentLens AI Ranked Output Report', size: 20, bold: true, color: '0.17 0.14 0.45 rg', gap: 26 },
+      { text: `JD / Role: ${roleProfile.title}`, bold: true },
+      { text: `Generated: ${generatedAt}` },
+      { text: 'Report type: sample PDF report' },
+      { text: 'Upload candidate CSV/JSON, run ranking, apply filters, then download the live PDF from the AI Ranking page.', gap: 18 },
+      { text: 'This report is designed for HR review, hiring manager sharing, client submission, and audit archive.' },
     ]
   }
   return [
-    `Generated candidates: ${candidates.length}`,
-    `Shortlisted candidates: ${candidates.filter((candidate) => candidate.status === 'Shortlisted').length}`,
-    ...candidates.slice(0, 10).map((candidate) => `#${candidate.rank} ${candidate.name} - ${candidate.finalScore}/100 - ${candidate.status}. ${candidate.reason}`),
+    { text: 'TalentLens AI Ranked Output Report', size: 20, bold: true, color: '0.17 0.14 0.45 rg', gap: 26 },
+    { text: `JD / Role: ${roleProfile.title}`, size: 12, bold: true },
+    { text: `Generated: ${generatedAt}` },
+    { text: `Company: ${companyProfile.companyName} | Recruiter: ${companyProfile.recruiterName}` },
+    { text: `Report filter: ${statusFilter || 'All statuses'} | Minimum score: ${filters.minimumScore || 'Any'} | Skills: ${filters.skills || 'Any'} | Experience: ${filters.experience || 'Any'}`, gap: 18 },
+    { text: 'Scoring method', size: 13, bold: true, color: '0.17 0.14 0.45 rg' },
+    { text: 'Final Score = 40% semantic fit + 25% skill match + 20% experience match + 10% behavioral signals + 5% activity signals.', gap: 18 },
+    { text: 'JD intelligence', size: 13, bold: true, color: '0.17 0.14 0.45 rg' },
+    { text: `Required skills: ${roleProfile.requiredSkills.join(', ') || 'Not specified'}` },
+    { text: `Preferred skills: ${roleProfile.preferredSkills.join(', ') || 'Not specified'}` },
+    { text: `Experience target: ${roleProfile.minimumYears ? `${roleProfile.minimumYears}+ years` : 'Not specified'}`, gap: 18 },
+    { text: 'Status summary', size: 13, bold: true, color: '0.17 0.14 0.45 rg' },
+    { text: Object.entries(counts).map(([status, count]) => `${status}: ${count}`).join(' | ') || 'No statuses available', gap: 18 },
+    { text: 'Candidate decisions', size: 13, bold: true, color: '0.17 0.14 0.45 rg' },
+    ...candidates.flatMap((candidate) => {
+      const application = getCandidateApplicationSnapshot(candidate, applications).current
+      const status = application?.currentStatus || candidate.status
+      const hrComment = application?.hrComment || 'No HR comment recorded.'
+      const appliedAt = application ? formatDate(application.lastAppliedAt) : 'No application date'
+      return [
+        { text: `#${candidate.rank} ${candidate.name} | ${candidate.email}`, bold: true, gap: 13 },
+        { text: `Status: ${status} | Final: ${candidate.finalScore}/100 | Semantic: ${candidate.semanticScore} | Skill: ${candidate.skillScore} | Experience: ${candidate.experienceScore} | Behavior: ${candidate.behaviorScore}`, indent: 10 },
+        { text: `Applied: ${appliedAt} | Matched skills: ${candidate.matchedSkills.join(', ') || 'None'} | Missing: ${candidate.missingSkills.join(', ') || 'None'}`, indent: 10 },
+        ...wrapPdfLine(`AI explanation: ${candidate.reason}`, 92).map((line) => ({ text: line, indent: 10 })),
+        ...wrapPdfLine(`HR comment: ${hrComment}`, 92).map((line, index) => ({ text: line, indent: 10, gap: index === 0 ? 13 : 12 })),
+        { text: ' ', gap: 6 },
+      ] satisfies PdfLine[]
+    }),
   ]
 }
 
-function downloadRankedPdf(candidates: Candidate[], filename = 'talentlens-ranked-output-report.pdf') {
-  downloadFile(filename, buildSimplePdf('TalentLens AI Ranked Output Report', rankedReportLines(candidates)), 'application/pdf')
+function downloadRankedPdf(options: RankedReportOptions, filename = 'talentlens-ranked-output-report.pdf') {
+  downloadFile(filename, buildPdfDocument(buildRankedReportLines(options)), 'application/pdf')
+}
+
+function createRankedReportOptions(
+  candidates: Candidate[],
+  applications: ApplicationRecord[] = [],
+  roleProfile = getActiveRoleProfile(),
+  statusFilter = '',
+  filters = { minimumScore: '', skills: '', experience: '' },
+): RankedReportOptions {
+  return {
+    candidates,
+    applications,
+    roleProfile,
+    companyProfile: loadSessionProfile('company'),
+    statusFilter,
+    filters,
+  }
 }
 
 function candidateToRow(candidate: Candidate): Record<string, string> {
@@ -1790,7 +1911,7 @@ function DataPage() {
             <FileUploadBox title="Attach existing ranked PDF report" accept=".pdf" format="PDF" note="Optional archive upload. Generate fresh PDF reports from the AI Ranking page." />
           </div>
           <div className="mt-5 flex flex-wrap gap-3">
-            <NeumorphicButton variant="soft" onClick={() => downloadRankedPdf([], 'talentlens-sample-ranked-output-report.pdf')}>
+            <NeumorphicButton variant="soft" onClick={() => downloadRankedPdf(createRankedReportOptions([]), 'talentlens-sample-ranked-output-report.pdf')}>
               <Download className="h-4 w-4" /> Download sample PDF
             </NeumorphicButton>
             <NeumorphicButton to="/company/ranking">
@@ -2339,7 +2460,7 @@ function UploadCandidateDatasetPage() {
                 </div>
               )}
               <div className="mt-5 flex flex-wrap gap-3">
-                <NeumorphicButton variant="soft" onClick={() => downloadRankedPdf([], 'talentlens-sample-ranked-output-report.pdf')}>
+                <NeumorphicButton variant="soft" onClick={() => downloadRankedPdf(createRankedReportOptions([]), 'talentlens-sample-ranked-output-report.pdf')}>
                   <Download className="h-4 w-4" />Sample PDF report
                 </NeumorphicButton>
                 <NeumorphicButton variant="soft" onClick={() => downloadFile('talentlens-example-ranked-output.csv', sampleRankedOutputCsv)}>
@@ -2362,6 +2483,7 @@ function RankingResultPage() {
   const [minimumScore, setMinimumScore] = useState('')
   const [skillFilter, setSkillFilter] = useState('')
   const [experienceFilter, setExperienceFilter] = useState('')
+  const [statusFilter, setStatusFilter] = useState('')
   const [shortlistedOnly, setShortlistedOnly] = useState(false)
   const filteredCandidates = useMemo(() => {
     const min = Number(minimumScore) || 0
@@ -2370,15 +2492,17 @@ function RankingResultPage() {
     return candidates.filter((candidate) => {
       const candidateYears = candidate.experienceYears || 0
       const skillMatch = !skillTerms.length || skillTerms.every((skill) => (candidate.skills || []).some((candidateSkill) => candidateSkill.toLowerCase().includes(skill)))
+      const currentStatus = getDisplayStatus(candidate, applications)
       return (
         candidate.finalScore >= min &&
         skillMatch &&
         (!minYears || candidateYears >= minYears) &&
-        (!shortlistedOnly || isPositiveStatus(candidate.status))
+        (!statusFilter || currentStatus === statusFilter) &&
+        (!shortlistedOnly || isPositiveStatus(currentStatus))
       )
     })
-  }, [candidates, experienceFilter, minimumScore, shortlistedOnly, skillFilter])
-  const shortlisted = useMemo(() => filteredCandidates.filter((c) => isPositiveStatus(c.status)), [filteredCandidates])
+  }, [applications, candidates, experienceFilter, minimumScore, shortlistedOnly, skillFilter, statusFilter])
+  const shortlisted = useMemo(() => filteredCandidates.filter((candidate) => isPositiveStatus(getDisplayStatus(candidate, applications))), [applications, filteredCandidates])
   async function simulateApi() {
     if (!candidates.length) return
     setRunning(true)
@@ -2412,17 +2536,18 @@ function RankingResultPage() {
             </div>
           ))}
         </div>
-        <div className="mt-6 grid gap-4 md:grid-cols-4">
+        <div className="mt-6 grid gap-4 md:grid-cols-5">
           <label><span className="form-label">Minimum score</span><input className="neo-input" placeholder="80" value={minimumScore} onChange={(event) => setMinimumScore(event.target.value)} /></label>
           <label><span className="form-label">Skills</span><input className="neo-input" placeholder="SQL, Python" value={skillFilter} onChange={(event) => setSkillFilter(event.target.value)} /></label>
           <label><span className="form-label">Minimum experience years</span><input className="neo-input" placeholder="3" value={experienceFilter} onChange={(event) => setExperienceFilter(event.target.value)} /></label>
+          <label><span className="form-label">Status for report</span><select className="neo-input" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All statuses</option>{['Approved', 'Rejected', 'On Hold', 'In Review', 'Needs Review', 'Applied'].map((status) => <option key={status} value={status}>{status}</option>)}</select></label>
           <label className="flex items-end gap-3 rounded-[20px] bg-bg p-4 neo-shadow"><input type="checkbox" checked={shortlistedOnly} onChange={(event) => setShortlistedOnly(event.target.checked)} /> <span className="font-bold">Shortlisted only</span></label>
         </div>
         <div className="mt-6 flex flex-wrap gap-3">
           <NeumorphicButton onClick={simulateApi} disabled={!candidates.length}><Target className="h-4 w-4" />Run Ranking</NeumorphicButton>
           <NeumorphicButton variant="soft" disabled={!filteredCandidates.length} onClick={() => downloadFile('talentlens-ranking.csv', candidateCsv(filteredCandidates))}><Download className="h-4 w-4" />Download CSV</NeumorphicButton>
           <NeumorphicButton variant="soft" disabled={!filteredCandidates.length} onClick={() => downloadFile('talentlens-ranking.json', JSON.stringify(filteredCandidates, null, 2), 'application/json')}><FileJson className="h-4 w-4" />Download JSON</NeumorphicButton>
-          <NeumorphicButton variant="soft" disabled={!filteredCandidates.length} onClick={() => downloadRankedPdf(filteredCandidates)}><FileText className="h-4 w-4" />Download PDF Report</NeumorphicButton>
+          <NeumorphicButton variant="soft" disabled={!filteredCandidates.length} onClick={() => downloadRankedPdf(createRankedReportOptions(filteredCandidates, applications, activeRole, statusFilter, { minimumScore, skills: skillFilter, experience: experienceFilter }))}><FileText className="h-4 w-4" />Download PDF Report</NeumorphicButton>
           <NeumorphicButton variant="soft" disabled={!shortlisted.length} onClick={() => downloadFile('talentlens-shortlist.csv', candidateCsv(shortlisted))}><UserCheck className="h-4 w-4" />Export Shortlist</NeumorphicButton>
           <NeumorphicButton variant="soft" onClick={() => downloadFile('talentlens-example-ranked-output.csv', sampleRankedOutputCsv)}><FileSpreadsheet className="h-4 w-4" />Example Output</NeumorphicButton>
         </div>
