@@ -126,7 +126,7 @@ type LlmSettings = {
   apiKey: string
 }
 
-type ApplicationStatus = 'Applied' | 'Under Review' | 'Shortlisted' | 'Interview' | 'Rejected' | 'Selected'
+type ApplicationStatus = 'Applied' | 'In Review' | 'On Hold' | 'Approved' | 'Rejected' | 'Under Review' | 'Shortlisted' | 'Interview' | 'Selected'
 
 type ApplicationHistoryEntry = {
   status: ApplicationStatus
@@ -207,7 +207,8 @@ const demoProfiles = {
   candidate: CandidateProfile
 }
 
-const applicationStatuses: ApplicationStatus[] = ['Applied', 'Under Review', 'Shortlisted', 'Interview', 'Rejected', 'Selected']
+const applicationStatuses: ApplicationStatus[] = ['Applied', 'In Review', 'On Hold', 'Approved', 'Rejected', 'Under Review', 'Shortlisted', 'Interview', 'Selected']
+const recruiterReviewStatuses: ApplicationStatus[] = ['Approved', 'Rejected', 'On Hold', 'In Review']
 
 const defaultSkills = ['SQL', 'Python', 'Power BI', 'Excel', 'Dashboarding', 'Analytics']
 const knownSkills = [
@@ -376,7 +377,11 @@ function saveJobs(jobs: Job[]) {
 }
 
 function normalizeApplicationStatus(value = ''): ApplicationStatus {
-  return applicationStatuses.find((status) => status.toLowerCase() === value.toLowerCase()) || 'Applied'
+  const normalized = value.trim().toLowerCase()
+  if (normalized === 'under review' || normalized === 'needs review') return 'In Review'
+  if (normalized === 'selected' || normalized === 'shortlisted') return 'Approved'
+  if (normalized === 'hold' || normalized === 'onhold') return 'On Hold'
+  return applicationStatuses.find((status) => status.toLowerCase() === normalized) || 'Applied'
 }
 
 function sortApplicationsByRecent(applications: ApplicationRecord[]) {
@@ -385,6 +390,10 @@ function sortApplicationsByRecent(applications: ApplicationRecord[]) {
     const leftDate = Date.parse(left.lastAppliedAt || left.appliedAt || '')
     return rightDate - leftDate
   })
+}
+
+function getApplicationDate(application: Partial<ApplicationRecord>, fallback = new Date().toISOString()) {
+  return application.lastAppliedAt || application.appliedAt || application.history?.[0]?.updatedAt || fallback
 }
 
 function loadApplications() {
@@ -419,17 +428,17 @@ function loadApplications() {
         candidatePhone: application.candidatePhone || '',
         jobId: application.jobId || `job-${index + 1}`,
         jobTitle: application.jobTitle || 'Untitled role',
-        appliedAt: application.appliedAt || application.lastAppliedAt || new Date().toISOString(),
-        lastAppliedAt: application.lastAppliedAt || application.appliedAt || new Date().toISOString(),
+        appliedAt: application.appliedAt || getApplicationDate(application),
+        lastAppliedAt: getApplicationDate(application),
         currentStatus: normalizeApplicationStatus(application.currentStatus),
         hrComment: application.hrComment || '',
         history: Array.isArray(application.history)
           ? application.history.map<ApplicationHistoryEntry>((entry) => ({
               status: normalizeApplicationStatus(entry?.status),
               hrComment: entry?.hrComment || '',
-              updatedAt: entry?.updatedAt || application.lastAppliedAt || application.appliedAt || new Date().toISOString(),
+              updatedAt: entry?.updatedAt || getApplicationDate(application),
             }))
-          : [],
+          : [{ status: normalizeApplicationStatus(application.currentStatus), hrComment: application.hrComment || 'Imported application record.', updatedAt: getApplicationDate(application) }],
         repeatCount: Number(application.repeatCount || 1),
         source: application.source === 'manual-review' ? 'manual-review' : 'candidate-application',
       })),
@@ -680,6 +689,18 @@ function syncCandidateStatus(candidateId: string, candidateEmail: string, status
   saveCandidates(updated)
 }
 
+function isPositiveStatus(status?: string) {
+  return status === 'Approved' || status === 'Selected' || status === 'Shortlisted'
+}
+
+function isWarningStatus(status?: string) {
+  return status === 'Rejected' || status === 'On Hold'
+}
+
+function isReviewLocked(application?: ApplicationRecord) {
+  return !!application && recruiterReviewStatuses.includes(normalizeApplicationStatus(application.currentStatus))
+}
+
 function saveCandidateReview(candidate: Candidate, status: ApplicationStatus, hrComment: string) {
   const applications = loadApplications()
   const matches = getCandidateApplications(candidate, applications)
@@ -688,7 +709,7 @@ function saveCandidateReview(candidate: Candidate, status: ApplicationStatus, hr
   const comment = hrComment.trim()
   const historyEntry: ApplicationHistoryEntry = {
     status,
-    hrComment: comment || (status === 'Rejected' ? 'Candidate marked as rejected by recruiter.' : 'Candidate review updated by recruiter.'),
+    hrComment: comment || (status === 'Rejected' ? 'Candidate marked as rejected by recruiter.' : `Candidate marked as ${status.toLowerCase()} by recruiter.`),
     updatedAt: now,
   }
 
@@ -1505,7 +1526,7 @@ function CandidateTable({ candidates, applications = [] }: { candidates: Candida
                   <td className="px-4 py-4">{candidate.experienceScore}</td>
                   <td className="px-4 py-4">{candidate.behaviorScore}</td>
                   <td className="px-4 py-4">
-                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', currentStatus === 'Shortlisted' || currentStatus === 'Selected' ? 'bg-success/10 text-success' : currentStatus === 'Rejected' ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
+                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', isPositiveStatus(currentStatus) ? 'bg-success/10 text-success' : isWarningStatus(currentStatus) ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
                       {currentStatus}
                     </span>
                     {application.current?.hrComment && <div className="mt-2 max-w-[220px] text-xs leading-5 text-muted">{application.current.hrComment}</div>}
@@ -1911,7 +1932,7 @@ function CompanyDashboard() {
   const jobs = useStoredJobs()
   const applications = useStoredApplications()
   const companyProfile = loadSessionProfile('company')
-  const shortlisted = applications.filter((application) => application.currentStatus === 'Shortlisted' || application.currentStatus === 'Selected').length || candidates.filter((candidate) => candidate.status === 'Shortlisted').length
+  const shortlisted = applications.filter((application) => isPositiveStatus(application.currentStatus)).length || candidates.filter((candidate) => candidate.status === 'Shortlisted' || candidate.status === 'Approved').length
   const repeatedApplicants = new Set(applications.filter((application) => application.repeatCount > 1).map((application) => application.candidateEmail.toLowerCase())).size
   return (
     <Shell role="company">
@@ -1970,7 +1991,7 @@ function CompanyDashboard() {
                     <div className="mt-1 text-xs text-muted">{application.jobTitle}</div>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', application.currentStatus === 'Shortlisted' || application.currentStatus === 'Selected' ? 'bg-success/10 text-success' : application.currentStatus === 'Rejected' ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
+                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', isPositiveStatus(application.currentStatus) ? 'bg-success/10 text-success' : isWarningStatus(application.currentStatus) ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
                       {application.currentStatus}
                     </span>
                     {application.repeatCount > 1 && <span className="rounded-full bg-warning/10 px-3 py-1 text-xs font-black text-warning">Repeated x{application.repeatCount}</span>}
@@ -2353,11 +2374,11 @@ function RankingResultPage() {
         candidate.finalScore >= min &&
         skillMatch &&
         (!minYears || candidateYears >= minYears) &&
-        (!shortlistedOnly || candidate.status === 'Shortlisted')
+        (!shortlistedOnly || isPositiveStatus(candidate.status))
       )
     })
   }, [candidates, experienceFilter, minimumScore, shortlistedOnly, skillFilter])
-  const shortlisted = useMemo(() => filteredCandidates.filter((c) => c.status === 'Shortlisted'), [filteredCandidates])
+  const shortlisted = useMemo(() => filteredCandidates.filter((c) => isPositiveStatus(c.status)), [filteredCandidates])
   async function simulateApi() {
     if (!candidates.length) return
     setRunning(true)
@@ -2420,9 +2441,15 @@ function CandidateDetailPage() {
   const [note, setNote] = useState('')
   const [savedMessage, setSavedMessage] = useState('')
   const applicationSnapshot = candidate ? getCandidateApplicationSnapshot(candidate, applications) : null
+  const [reviewStatus, setReviewStatus] = useState<ApplicationStatus>('In Review')
+  const [isEditingReview, setIsEditingReview] = useState(true)
+  const reviewLocked = !isEditingReview && isReviewLocked(applicationSnapshot?.current)
   useEffect(() => {
+    const currentStatus = normalizeApplicationStatus(applicationSnapshot?.current?.currentStatus)
     setNote(applicationSnapshot?.current?.hrComment || '')
-  }, [applicationSnapshot?.current?.id, applicationSnapshot?.current?.hrComment])
+    setReviewStatus(recruiterReviewStatuses.includes(currentStatus) ? currentStatus : 'In Review')
+    setIsEditingReview(!isReviewLocked(applicationSnapshot?.current))
+  }, [applicationSnapshot?.current?.id, applicationSnapshot?.current?.hrComment, applicationSnapshot?.current?.currentStatus])
   if (!candidate) {
     return (
       <Shell role="company">
@@ -2448,7 +2475,7 @@ function CandidateDetailPage() {
               <div className="mt-5 grid gap-4 lg:grid-cols-2">
                 <div className="rounded-[20px] bg-bg p-4 neo-inset">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', applicationSnapshot?.current?.currentStatus === 'Shortlisted' || applicationSnapshot?.current?.currentStatus === 'Selected' ? 'bg-success/10 text-success' : applicationSnapshot?.current?.currentStatus === 'Rejected' ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
+                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', isPositiveStatus(applicationSnapshot?.current?.currentStatus) ? 'bg-success/10 text-success' : isWarningStatus(applicationSnapshot?.current?.currentStatus) ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
                       {applicationSnapshot?.current?.currentStatus || candidate.status}
                     </span>
                     {applicationSnapshot?.isRepeated && <span className="rounded-full bg-warning/10 px-3 py-1 text-xs font-black text-warning">Repeated applicant x{applicationSnapshot.totalApplications}</span>}
@@ -2479,22 +2506,46 @@ function CandidateDetailPage() {
               <p className="mt-3 leading-7 text-muted">{candidate.reason}</p>
             </div>
             <div className="rounded-[24px] bg-bg p-6 neo-shadow">
-              <h2 className="text-xl font-black">Recruiter notes</h2>
-              <textarea className="neo-input mt-4 min-h-28" placeholder="Add evaluation notes, interview feedback, or next steps." value={note} onChange={(event) => setNote(event.target.value)} />
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-xl font-black">Recruiter decision</h2>
+                  <p className="mt-1 text-sm text-muted">Choose a status, add the HR comment, then save the review.</p>
+                </div>
+                {reviewLocked && (
+                  <NeumorphicButton variant="soft" onClick={() => {
+                    setIsEditingReview(true)
+                    setSavedMessage('Review unlocked. Make changes, then save again.')
+                  }}>
+                    <Save className="h-4 w-4" />Edit review
+                  </NeumorphicButton>
+                )}
+              </div>
+              <div className="mt-5 grid gap-3 sm:grid-cols-4">
+                {([
+                  ['Approved', UserCheck],
+                  ['Rejected', X],
+                  ['On Hold', Clock],
+                  ['In Review', Activity],
+                ] as const).map(([status, Icon]) => (
+                  <NeumorphicButton
+                    key={status}
+                    variant={reviewStatus === status ? 'primary' : 'soft'}
+                    disabled={reviewLocked}
+                    onClick={() => setReviewStatus(status)}
+                  >
+                    <Icon className="h-4 w-4" />{status}
+                  </NeumorphicButton>
+                ))}
+              </div>
+              {reviewLocked && <div className="mt-4 rounded-[20px] bg-primary/10 p-4 text-sm font-bold text-primary">This review is locked after saving. Click Edit review to update the status or HR comment.</div>}
+              <textarea disabled={reviewLocked} className="neo-input mt-4 min-h-28 disabled:opacity-60" placeholder="Add evaluation notes, interview feedback, or next steps." value={note} onChange={(event) => setNote(event.target.value)} />
               {savedMessage && <div className="mt-4 rounded-[20px] bg-success/10 p-4 text-sm font-bold text-success">{savedMessage}</div>}
               <div className="mt-5 flex flex-wrap gap-3">
-                <NeumorphicButton onClick={() => {
-                  saveCandidateReview(candidate, 'Shortlisted', note)
-                  setSavedMessage('Candidate marked as shortlisted. Dashboard status and HR note are updated.')
-                }}><UserCheck className="h-4 w-4" />Shortlist</NeumorphicButton>
-                <NeumorphicButton variant="soft" onClick={() => {
-                  saveCandidateReview(candidate, 'Rejected', note)
-                  setSavedMessage('Candidate marked as rejected. Dashboard status and HR note are updated.')
-                }}><X className="h-4 w-4" />Reject</NeumorphicButton>
-                <NeumorphicButton variant="soft" onClick={() => {
-                  saveCandidateReview(candidate, applicationSnapshot?.current?.currentStatus || 'Under Review', note)
-                  setSavedMessage('HR comment saved and visible in dashboard + tracking views.')
-                }}><Save className="h-4 w-4" />Save</NeumorphicButton>
+                <NeumorphicButton disabled={reviewLocked} onClick={() => {
+                  saveCandidateReview(candidate, reviewStatus, note)
+                  setIsEditingReview(false)
+                  setSavedMessage(`${reviewStatus} saved. Dashboard status, candidate tracking, and HR comment are updated.`)
+                }}><Save className="h-4 w-4" />Save Review</NeumorphicButton>
                 <NeumorphicButton variant="soft" onClick={() => downloadFile(`${candidate.id}-profile.json`, JSON.stringify({ ...candidate, applications: applicationSnapshot?.matches || [], recruiterComment: note }, null, 2), 'application/json')}><Download className="h-4 w-4" />Download Profile</NeumorphicButton>
               </div>
             </div>
@@ -2548,7 +2599,7 @@ function CandidateDashboard() {
               {latestApplication ? (
                 <div className="rounded-[20px] bg-bg p-5 neo-inset">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', latestApplication.currentStatus === 'Shortlisted' || latestApplication.currentStatus === 'Selected' ? 'bg-success/10 text-success' : latestApplication.currentStatus === 'Rejected' ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
+                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', isPositiveStatus(latestApplication.currentStatus) ? 'bg-success/10 text-success' : isWarningStatus(latestApplication.currentStatus) ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
                       {latestApplication.currentStatus}
                     </span>
                     {latestApplication.repeatCount > 1 && <span className="rounded-full bg-warning/10 px-3 py-1 text-xs font-black text-warning">Repeated x{latestApplication.repeatCount}</span>}
@@ -2575,7 +2626,7 @@ function CandidateDashboard() {
                     <div className="font-black">{application.jobTitle}</div>
                     <div className="mt-1 text-xs text-muted">Applied on {formatDate(application.appliedAt)}</div>
                   </div>
-                  <span className={cx('rounded-full px-3 py-1 text-xs font-black', application.currentStatus === 'Shortlisted' || application.currentStatus === 'Selected' ? 'bg-success/10 text-success' : application.currentStatus === 'Rejected' ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
+                  <span className={cx('rounded-full px-3 py-1 text-xs font-black', isPositiveStatus(application.currentStatus) ? 'bg-success/10 text-success' : isWarningStatus(application.currentStatus) ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
                     {application.currentStatus}
                   </span>
                 </div>
@@ -2725,7 +2776,7 @@ function ApplicationTrackingPage() {
                     <p className="mt-2 text-sm text-muted">Applied on {formatDate(application.appliedAt)}</p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', application.currentStatus === 'Shortlisted' || application.currentStatus === 'Selected' ? 'bg-success/10 text-success' : application.currentStatus === 'Rejected' ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
+                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', isPositiveStatus(application.currentStatus) ? 'bg-success/10 text-success' : isWarningStatus(application.currentStatus) ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
                       {application.currentStatus}
                     </span>
                     {application.repeatCount > 1 && <span className="rounded-full bg-warning/10 px-3 py-1 text-xs font-black text-warning">Repeated x{application.repeatCount}</span>}
