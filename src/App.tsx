@@ -6,6 +6,7 @@ import {
   Award,
   BarChart3,
   Bookmark,
+  Brain,
   BriefcaseBusiness,
   Calendar,
   CheckCircle2,
@@ -21,6 +22,7 @@ import {
   FileText,
   Gauge,
   Home,
+  KeyRound,
   Layers3,
   LogOut,
   Mail,
@@ -31,6 +33,7 @@ import {
   Save,
   Search,
   Settings,
+  Server,
   ShieldCheck,
   SlidersHorizontal,
   Target,
@@ -101,15 +104,37 @@ type RoleProfile = {
   keywords: string[]
   minimumYears: number
   responsibilities: string[]
+  softSkills: string[]
+  domainRequirements: string[]
   sourceText: string
+}
+
+type SavedJD = {
+  id: string
+  name: string
+  fileName?: string
+  text: string
+  createdAt: string
+  profile: RoleProfile
+}
+
+type LlmSettings = {
+  enabled: boolean
+  provider: string
+  endpoint: string
+  model: string
+  apiKey: string
 }
 
 const storageKeys = {
   candidates: 'talentlens:v2:candidates',
+  jds: 'talentlens:v2:jds',
   jobs: 'talentlens:v2:jobs',
   applications: 'talentlens:v2:applications',
   activeJobId: 'talentlens:v2:active-job-id',
+  activeRoleSource: 'talentlens:v2:active-role-source',
   jdText: 'talentlens:v2:jd-text',
+  llmSettings: 'talentlens:v2:llm-settings',
   companySession: 'talentlens:v2:company-session',
   candidateSession: 'talentlens:v2:candidate-session',
 }
@@ -149,6 +174,14 @@ const knownSkills = [
   'AWS',
   'Azure',
 ]
+
+const defaultLlmSettings: LlmSettings = {
+  enabled: false,
+  provider: 'OpenAI compatible',
+  endpoint: 'https://api.openai.com/v1/chat/completions',
+  model: 'gpt-4o-mini',
+  apiKey: '',
+}
 
 const sampleCandidateCsv =
   'candidate_id,name,email,skills,experience,projects,education,platform_activity,resume_text\n' +
@@ -233,6 +266,15 @@ function saveCandidates(candidates: Candidate[]) {
   window.dispatchEvent(new Event(storageKeys.candidates))
 }
 
+function loadJds() {
+  return safeJson<SavedJD[]>(localStorage.getItem(storageKeys.jds), [])
+}
+
+function saveJds(jds: SavedJD[]) {
+  localStorage.setItem(storageKeys.jds, JSON.stringify(jds))
+  window.dispatchEvent(new Event(storageKeys.jds))
+}
+
 function loadJobs() {
   return safeJson<Job[]>(localStorage.getItem(storageKeys.jobs), [])
 }
@@ -242,10 +284,45 @@ function saveJobs(jobs: Job[]) {
   window.dispatchEvent(new Event(storageKeys.jobs))
 }
 
+function loadLlmSettings() {
+  return { ...defaultLlmSettings, ...safeJson<Partial<LlmSettings>>(localStorage.getItem(storageKeys.llmSettings), {}) }
+}
+
+function saveLlmSettings(settings: LlmSettings) {
+  localStorage.setItem(storageKeys.llmSettings, JSON.stringify(settings))
+}
+
 function getActiveJob() {
   const jobs = loadJobs()
   const activeJobId = localStorage.getItem(storageKeys.activeJobId)
   return jobs.find((job) => job.id === activeJobId) || jobs[0]
+}
+
+function getRoleSources() {
+  const jds = loadJds().map((jd) => ({
+    id: `jd:${jd.id}`,
+    label: `JD / ${jd.name}`,
+    profile: jd.profile,
+  }))
+  const jobs = loadJobs().map((job) => ({
+    id: `job:${job.id}`,
+    label: `Job / ${job.title}`,
+    profile: getRoleProfileFromJob(job),
+  }))
+  return [...jds, ...jobs]
+}
+
+function setActiveRoleSource(sourceId: string) {
+  localStorage.setItem(storageKeys.activeRoleSource, sourceId)
+  if (sourceId.startsWith('job:')) {
+    localStorage.setItem(storageKeys.activeJobId, sourceId.replace('job:', ''))
+  }
+}
+
+function getActiveRoleProfile() {
+  const sources = getRoleSources()
+  const active = localStorage.getItem(storageKeys.activeRoleSource)
+  return sources.find((source) => source.id === active)?.profile || sources[0]?.profile || getRoleProfileFromJob(getActiveJob())
 }
 
 function normalizeText(value = '') {
@@ -259,6 +336,18 @@ function unique(values: string[]) {
 function inferSkills(text = '') {
   const normalized = normalizeText(text)
   return knownSkills.filter((skill) => normalized.includes(skill.toLowerCase()))
+}
+
+function extractSkillPhrases(text = '') {
+  const sectionMatches = text.match(/(?:required skills|must have|requirements|skills|technologies|tools|preferred skills)[:\-\n]+([\s\S]{0,500})/gi) || []
+  const sectionTerms = sectionMatches.flatMap((section) =>
+    section
+      .replace(/required skills|must have|requirements|skills|technologies|tools|preferred skills/gi, '')
+      .split(/[,;|•\n]/)
+      .map((term) => term.replace(/[^a-zA-Z0-9+#. ]/g, '').trim())
+      .filter((term) => term.length >= 2 && term.length <= 32),
+  )
+  return unique([...inferSkills(text), ...sectionTerms]).slice(0, 18)
 }
 
 function tokenize(value = '') {
@@ -301,24 +390,41 @@ function clampScore(value: number) {
   return Math.max(0, Math.min(100, Math.round(value)))
 }
 
-function getRoleProfile(job = getActiveJob()): RoleProfile {
-  const jdText = localStorage.getItem(storageKeys.jdText) || ''
-  const sourceText = [job?.title, job?.description, job?.requiredSkills, job?.preferredSkills, jdText].filter(Boolean).join(' ')
-  const required = unique([...splitSkills(job?.requiredSkills || ''), ...inferSkills(sourceText)])
-  const preferred = unique(splitSkills(job?.preferredSkills || ''))
+function extractRoleProfile(name: string, text: string): RoleProfile {
+  const sourceText = text.trim()
+  const required = extractSkillPhrases(sourceText)
+  const preferred = unique(splitSkills((sourceText.match(/preferred skills?[:\-\n]+([^\n.]+)/i)?.[1] || ''))).filter(Boolean)
   return {
-    title: job?.title || sourceText.match(/(analyst|engineer|developer|manager|designer|recruiter)/i)?.[0] || 'Uploaded role',
+    title: name || sourceText.match(/(analyst|engineer|developer|manager|designer|recruiter|specialist|consultant)/i)?.[0] || 'Uploaded role',
     requiredSkills: required.length ? required : defaultSkills,
     preferredSkills: preferred,
     keywords: keywordSet(sourceText),
-    minimumYears: getYears([job?.level, job?.description, jdText].filter(Boolean).join(' ')),
+    minimumYears: getYears(sourceText),
     responsibilities: sourceText
       .split(/[.\n]/)
       .map((item) => item.trim())
       .filter((item) => item.length > 35)
       .slice(0, 4),
+    softSkills: unique(['communication', 'ownership', 'problem solving', 'collaboration'].filter((skill) => normalizeText(sourceText).includes(skill.replace(' ', '')) || normalizeText(sourceText).includes(skill))).slice(0, 6),
+    domainRequirements: keywordSet(sourceText).filter((keyword) => !required.map((skill) => skill.toLowerCase()).includes(keyword)).slice(0, 10),
     sourceText,
   }
+}
+
+function getRoleProfileFromJob(job = getActiveJob()): RoleProfile {
+  const jdText = localStorage.getItem(storageKeys.jdText) || ''
+  const sourceText = [job?.title, job?.description, job?.requiredSkills, job?.preferredSkills, jdText].filter(Boolean).join(' ')
+  const profile = extractRoleProfile(job?.title || 'Uploaded role', sourceText)
+  return {
+    ...profile,
+    requiredSkills: unique([...splitSkills(job?.requiredSkills || ''), ...profile.requiredSkills]),
+    preferredSkills: unique([...splitSkills(job?.preferredSkills || ''), ...profile.preferredSkills]),
+    minimumYears: getYears([job?.level, job?.description, jdText].filter(Boolean).join(' ')) || profile.minimumYears,
+  }
+}
+
+function getRoleProfile(job = getActiveJob()): RoleProfile {
+  return job ? getRoleProfileFromJob(job) : getActiveRoleProfile()
 }
 
 function useStoredCandidates() {
@@ -347,6 +453,20 @@ function useStoredJobs() {
     }
   }, [])
   return jobs
+}
+
+function useStoredJds() {
+  const [jds, setJds] = useState<SavedJD[]>(() => loadJds())
+  useEffect(() => {
+    const sync = () => setJds(loadJds())
+    window.addEventListener(storageKeys.jds, sync)
+    window.addEventListener('storage', sync)
+    return () => {
+      window.removeEventListener(storageKeys.jds, sync)
+      window.removeEventListener('storage', sync)
+    }
+  }, [])
+  return jds
 }
 
 function downloadFile(filename: string, text: string, type = 'text/csv') {
@@ -390,6 +510,28 @@ function parseCsv(text: string) {
   row.push(current.trim())
   if (row.some(Boolean)) rows.push(row)
   return rows
+}
+
+async function extractTextFromDocument(file: File) {
+  const extension = file.name.split('.').pop()?.toLowerCase()
+  if (extension === 'pdf') {
+    const pdfjs = await import('pdfjs-dist')
+    pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.mjs', import.meta.url).toString()
+    const pdf = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise
+    const pages: string[] = []
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber)
+      const content = await page.getTextContent()
+      pages.push(content.items.map((item) => ('str' in item ? item.str : '')).join(' '))
+    }
+    return pages.join('\n\n')
+  }
+  if (extension === 'docx') {
+    const mammoth = await import('mammoth/mammoth.browser')
+    const result = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() })
+    return result.value
+  }
+  return file.text()
 }
 
 function splitSkills(value = '') {
@@ -467,7 +609,7 @@ async function parseCandidateFile(file: File) {
   const extension = file.name.split('.').pop()?.toLowerCase()
   const parsedRows = parseCsv(text)
   const headers = parsedRows[0] || []
-  const role = getRoleProfile()
+  const role = getActiveRoleProfile()
   const rows =
     extension === 'json'
       ? normalizeJsonRows(text)
@@ -534,8 +676,77 @@ function normalizeApiCandidates(value: unknown, fallback: Candidate[]) {
     .map((candidate, index) => ({ ...candidate, rank: index + 1 }))
 }
 
+async function callLlmRanking(settings: LlmSettings, roleProfile: RoleProfile, candidates: Candidate[]) {
+  if (!settings.enabled || !settings.apiKey || !settings.endpoint || !settings.model) return candidates
+  const payload = {
+    model: settings.model,
+    temperature: 0.1,
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You are an AI recruiting scoring engine. Return only valid JSON with a candidates array. Preserve each candidate id. Score 0-100 using role fit, semantic relevance, skills, experience, behavior, and activity. Include concise recruiter explanations.',
+      },
+      {
+        role: 'user',
+        content: JSON.stringify({
+          output_schema: {
+            candidates: [
+              {
+                id: 'candidate id',
+                finalScore: 0,
+                semanticScore: 0,
+                skillScore: 0,
+                experienceScore: 0,
+                behaviorScore: 0,
+                activityScore: 0,
+                status: 'Shortlisted | Under Review | Needs Review',
+                reason: 'short explanation',
+              },
+            ],
+          },
+          scoring_formula: '40% semantic, 25% skills, 20% experience, 10% behavior, 5% activity',
+          roleProfile,
+          candidates: candidates.map((candidate) => ({
+            id: candidate.id,
+            name: candidate.name,
+            email: candidate.email,
+            skills: candidate.skills,
+            projects: candidate.projects,
+            education: candidate.education,
+            platformActivity: candidate.platformActivity,
+            resumeText: candidate.resumeText.slice(0, 1400),
+            localScores: {
+              finalScore: candidate.finalScore,
+              semanticScore: candidate.semanticScore,
+              skillScore: candidate.skillScore,
+              experienceScore: candidate.experienceScore,
+              behaviorScore: candidate.behaviorScore,
+              activityScore: candidate.activityScore,
+            },
+          })),
+        }),
+      },
+    ],
+  }
+  const response = await fetch(settings.endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${settings.apiKey}`,
+    },
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) throw new Error('LLM request failed')
+  const data = await response.json()
+  const content = data?.choices?.[0]?.message?.content
+  if (!content) return candidates
+  return normalizeApiCandidates(JSON.parse(content), candidates)
+}
+
 async function runRankingEngine(candidates: Candidate[]) {
-  const roleProfile = getRoleProfile()
+  const roleProfile = getActiveRoleProfile()
   const localRanked = candidates
     .map((candidate, index) => scoreCandidate(candidateToRow(candidate), index, roleProfile))
     .sort((a, b) => b.finalScore - a.finalScore)
@@ -545,6 +756,15 @@ async function runRankingEngine(candidates: Candidate[]) {
     try {
       const response = await api.post('/rank', { roleProfile, candidates: localRanked })
       return normalizeApiCandidates(response.data, localRanked)
+    } catch {
+      return localRanked
+    }
+  }
+
+  const llmSettings = loadLlmSettings()
+  if (llmSettings.enabled && llmSettings.apiKey) {
+    try {
+      return await callLlmRanking(llmSettings, roleProfile, localRanked)
     } catch {
       return localRanked
     }
@@ -649,7 +869,7 @@ function Sidebar({ role }: { role: 'company' | 'candidate' }) {
     ['Upload JD', '/company/upload-jd', FileText],
     ['Upload Candidates', '/company/upload-candidates', Upload],
     ['AI Ranking', '/company/ranking', BarChart3],
-    ['Settings', '/company/dashboard', Settings],
+    ['Settings', '/company/settings', Settings],
     ['Logout', '/', LogOut],
   ] as const
   const candidateLinks = [
@@ -1432,41 +1652,98 @@ function CreateJobPage() {
 }
 
 function UploadJDPage() {
+  const savedJds = useStoredJds()
   const [analyzed, setAnalyzed] = useState(false)
+  const [jdName, setJdName] = useState('')
   const [jdText, setJdText] = useState(() => localStorage.getItem(storageKeys.jdText) || '')
+  const [fileName, setFileName] = useState('')
+  const [profile, setProfile] = useState<RoleProfile | null>(null)
+  const [error, setError] = useState('')
+  const [extracting, setExtracting] = useState(false)
+  async function handleJdFile(file: File) {
+    setError('')
+    setExtracting(true)
+    setFileName(file.name)
+    try {
+      const text = await extractTextFromDocument(file)
+      if (!text.trim()) {
+        setError('Could not extract text from this file. Try another PDF/DOCX or paste the JD text.')
+      } else {
+        setJdText(text)
+        if (!jdName) setJdName(file.name.replace(/\.[^.]+$/, ''))
+      }
+    } catch {
+      setError('Could not read this JD file. Try a text-based PDF/DOCX or paste the JD text.')
+    }
+    setExtracting(false)
+  }
+  function analyzeJd() {
+    const extracted = extractRoleProfile(jdName || 'Saved JD', jdText)
+    localStorage.setItem(storageKeys.jdText, jdText)
+    setProfile(extracted)
+    setAnalyzed(true)
+  }
+  function saveAnalyzedJd() {
+    if (!profile) return
+    const jd: SavedJD = {
+      id: `JD${Date.now()}`,
+      name: jdName || profile.title || 'Saved JD',
+      fileName,
+      text: jdText,
+      createdAt: new Date().toISOString(),
+      profile,
+    }
+    saveJds([jd, ...loadJds()])
+    setActiveRoleSource(`jd:${jd.id}`)
+  }
   return (
     <Shell role="company">
       <PageTransition>
-        <SectionTitle eyebrow="Role intelligence" title="Upload Job Description" copy="Paste a JD or upload PDF/DOCX, then review the extracted role signals." />
+        <SectionTitle eyebrow="Role intelligence" title="Analyze and Save Job Description" copy="Name each JD, paste text or upload PDF/DOCX, analyze it, then save it as a reusable matching profile." />
         <div className="mt-8 grid gap-6 xl:grid-cols-2">
           <div className="rounded-[24px] bg-bg p-6 neo-shadow">
-            <label><span className="form-label">Paste job description text</span><textarea className="neo-input min-h-64" value={jdText} onChange={(event) => setJdText(event.target.value)} placeholder="Paste the full job description here." /></label>
-            <div className="mt-5"><FileUploadBox title="Upload PDF or DOCX" accept=".pdf,.doc,.docx" format="JD" note="PDF/DOCX extraction can be connected to your backend parser." /></div>
+            <label><span className="form-label">JD name</span><input className="neo-input" value={jdName} onChange={(event) => setJdName(event.target.value)} placeholder="Example: Senior Data Analyst JD - May 2026" /></label>
+            <label className="mt-5 block"><span className="form-label">Paste job description text</span><textarea className="neo-input min-h-64" value={jdText} onChange={(event) => setJdText(event.target.value)} placeholder="Paste the full job description here." /></label>
+            <div className="mt-5"><FileUploadBox title={extracting ? 'Extracting JD text...' : 'Upload PDF, DOCX, or TXT'} accept=".pdf,.docx,.txt,.md" format="JD" note="The app extracts text locally in the browser, then analyzes the JD profile." onFile={handleJdFile} /></div>
+            {fileName && <div className="mt-4 rounded-[20px] bg-success/10 p-4 text-sm font-bold text-success">Loaded file: {fileName}</div>}
+            {error && <div className="mt-4 rounded-[20px] bg-warning/10 p-4 text-sm font-bold text-warning">{error}</div>}
             <NeumorphicButton
               className="mt-6"
-              onClick={() => {
-                localStorage.setItem(storageKeys.jdText, jdText)
-                setAnalyzed(true)
-              }}
+              onClick={analyzeJd}
               disabled={!jdText.trim()}
             >
               <Target className="h-4 w-4" />Analyze Job Description
             </NeumorphicButton>
+            <NeumorphicButton className="mt-6 ml-0 sm:ml-3" variant="soft" onClick={saveAnalyzedJd} disabled={!profile}>
+              <Save className="h-4 w-4" />Save JD Profile
+            </NeumorphicButton>
           </div>
           <div className="rounded-[24px] bg-bg p-6 neo-shadow">
             <h2 className="text-xl font-black">Preview extracted JD</h2>
-            {analyzed ? (
+            {analyzed && profile ? (
               <div className="mt-5 grid gap-4">
                 {[
-                  ['Role title', jdText.match(/analyst|engineer|manager|developer/i)?.[0] || 'Role detected from uploaded JD'],
-                  ['Required skills', inferSkills(jdText).join(', ') || 'Connect backend extraction for exact skill parsing'],
-                  ['Experience level', jdText.match(/\d+\+?\s*(years|yrs)/i)?.[0] || 'Not explicitly detected'],
-                  ['Responsibilities', 'Generated from the pasted job description text.'],
-                  ['Soft skills', 'Communication, ownership, structured problem solving'],
-                  ['Domain requirements', 'Detected from JD context after backend integration'],
+                  ['Role title', profile.title],
+                  ['Required skills', profile.requiredSkills.join(', ')],
+                  ['Preferred skills', profile.preferredSkills.join(', ') || 'None detected'],
+                  ['Experience level', profile.minimumYears ? `${profile.minimumYears}+ years` : 'Not explicitly detected'],
+                  ['Responsibilities', profile.responsibilities.join(' / ') || 'No long responsibility lines detected'],
+                  ['Soft skills', profile.softSkills.join(', ') || 'No soft skills explicitly detected'],
+                  ['Domain requirements', profile.domainRequirements.join(', ') || 'No domain terms detected'],
                 ].map(([k, v]) => <InfoRow key={k} label={k} value={v} />)}
               </div>
             ) : <EmptyState title="No analysis yet" copy="Paste a job description to enable analysis." />}
+          </div>
+        </div>
+        <div className="mt-8 rounded-[24px] bg-bg p-6 neo-shadow">
+          <h2 className="text-xl font-black">Saved JD profiles</h2>
+          <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {savedJds.length ? savedJds.map((jd) => (
+              <button className="rounded-[20px] bg-bg p-4 text-left neo-inset" key={jd.id} type="button" onClick={() => setActiveRoleSource(`jd:${jd.id}`)}>
+                <div className="font-black">{jd.name}</div>
+                <div className="mt-2 text-xs font-bold text-muted">{jd.profile.requiredSkills.slice(0, 5).join(', ')}</div>
+              </button>
+            )) : <EmptyState title="No saved JDs" copy="Analyze and save a JD to use it for candidate matching." compact />}
           </div>
         </div>
       </PageTransition>
@@ -1475,12 +1752,33 @@ function UploadJDPage() {
 }
 
 function UploadCandidateDatasetPage() {
+  const savedJds = useStoredJds()
+  const jobs = useStoredJobs()
   const [candidates, setCandidates] = useState<Candidate[]>(() => loadCandidates())
   const [reportReady, setReportReady] = useState(false)
   const [error, setError] = useState('')
+  const roleSources = useMemo(
+    () => [
+      ...savedJds.map((jd) => ({ id: `jd:${jd.id}`, label: `JD / ${jd.name}` })),
+      ...jobs.map((job) => ({ id: `job:${job.id}`, label: `Job / ${job.title}` })),
+    ],
+    [jobs, savedJds],
+  )
+  const [selectedSource, setSelectedSource] = useState(() => localStorage.getItem(storageKeys.activeRoleSource) || '')
   const navigate = useNavigate()
+  useEffect(() => {
+    if (!selectedSource && roleSources[0]) {
+      setSelectedSource(roleSources[0].id)
+      setActiveRoleSource(roleSources[0].id)
+    }
+  }, [roleSources, selectedSource])
   async function handleFile(file: File) {
     setError('')
+    if (!selectedSource) {
+      setError('Please create and select a saved JD or job before uploading candidate data.')
+      return
+    }
+    setActiveRoleSource(selectedSource)
     try {
       const parsed = await parseCandidateFile(file)
       if (!parsed.length) {
@@ -1493,6 +1791,13 @@ function UploadCandidateDatasetPage() {
       setError('Could not parse the file. Check the CSV/JSON format and try again.')
     }
   }
+  async function rescoreCurrentCandidates() {
+    if (!selectedSource || !candidates.length) return
+    setActiveRoleSource(selectedSource)
+    const ranked = await runRankingEngine(candidates)
+    saveCandidates(ranked)
+    setCandidates(ranked)
+  }
   return (
     <Shell role="company">
       <PageTransition>
@@ -1503,13 +1808,34 @@ function UploadCandidateDatasetPage() {
               <div>
                 <h2 className="text-2xl font-black">Candidate input file</h2>
                 <p className="mt-2 max-w-2xl text-sm leading-6 text-muted">
-                  This is the real ranking input. Add one row per candidate with skills, experience, projects, education, platform activity, and resume text.
+                  First choose the saved JD/job to match against. Then upload one row per candidate with skills, experience, projects, education, platform activity, and resume text.
                 </p>
               </div>
               <NeumorphicButton variant="soft" onClick={() => downloadFile('talentlens-sample-candidates.csv', sampleCandidateCsv)}>
                 <Download className="h-4 w-4" /> CSV template
               </NeumorphicButton>
             </div>
+            <label className="mt-6 block">
+              <span className="form-label">Choose JD / job profile for matching</span>
+              <select
+                className="neo-input"
+                value={selectedSource}
+                onChange={(event) => {
+                  setSelectedSource(event.target.value)
+                  setActiveRoleSource(event.target.value)
+                }}
+              >
+                <option value="">Select a saved JD or job</option>
+                {roleSources.map((source) => (
+                  <option key={source.id} value={source.id}>{source.label}</option>
+                ))}
+              </select>
+            </label>
+            {!roleSources.length && (
+              <div className="mt-4 rounded-[20px] bg-warning/10 p-4 text-sm font-bold text-warning">
+                No JD or job profile found. Analyze and save a JD first, or create a job.
+              </div>
+            )}
             <div className="mt-6">
               <FileUploadBox title="Drop candidate CSV/JSON or browse" accept=".csv,.json" format="CSV" note="Expected fields: candidate_id, name, email, skills, experience, projects, education, platform_activity, resume_text." onFile={handleFile} />
             </div>
@@ -1519,6 +1845,9 @@ function UploadCandidateDatasetPage() {
             </div>
             <NeumorphicButton className="mt-6" onClick={() => navigate('/company/ranking')} disabled={!candidates.length}>
               <PlayCircle className="h-4 w-4" />Run AI Ranking
+            </NeumorphicButton>
+            <NeumorphicButton className="mt-6 ml-0 sm:ml-3" variant="soft" onClick={rescoreCurrentCandidates} disabled={!candidates.length || !selectedSource}>
+              <Brain className="h-4 w-4" />Re-score with selected JD
             </NeumorphicButton>
           </div>
 
@@ -1565,6 +1894,7 @@ function UploadCandidateDatasetPage() {
 
 function RankingResultPage() {
   const candidates = useStoredCandidates()
+  const activeRole = getActiveRoleProfile()
   const [running, setRunning] = useState(false)
   const [minimumScore, setMinimumScore] = useState('')
   const [skillFilter, setSkillFilter] = useState('')
@@ -1598,6 +1928,15 @@ function RankingResultPage() {
     <Shell role="company">
       <PageTransition>
         <SectionTitle eyebrow="AI ranking" title="Ranked Shortlist" copy="Final Score = 40% Semantic Fit + 25% Skill Match + 20% Experience Match + 10% Behavioral Signals + 5% Activity Signals." />
+        <div className="mt-6 rounded-[24px] bg-bg p-5 neo-shadow">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <h2 className="text-xl font-black">Matching against: {activeRole.title}</h2>
+              <p className="mt-2 text-sm text-muted">Required: {activeRole.requiredSkills.join(', ')}</p>
+            </div>
+            <NeumorphicButton to="/company/upload-candidates" variant="soft">Change JD</NeumorphicButton>
+          </div>
+        </div>
         <div className="mt-6 grid gap-4 md:grid-cols-4">
           <label><span className="form-label">Minimum score</span><input className="neo-input" placeholder="80" value={minimumScore} onChange={(event) => setMinimumScore(event.target.value)} /></label>
           <label><span className="form-label">Skills</span><input className="neo-input" placeholder="SQL, Python" value={skillFilter} onChange={(event) => setSkillFilter(event.target.value)} /></label>
@@ -1807,6 +2146,71 @@ function ApplicationTrackingPage() {
   )
 }
 
+function CompanySettingsPage() {
+  const [settings, setSettings] = useState<LlmSettings>(() => loadLlmSettings())
+  const [saved, setSaved] = useState(false)
+  return (
+    <Shell role="company">
+      <PageTransition>
+        <SectionTitle eyebrow="Settings" title="LLM API and local matching settings" copy="TalentLens works locally without AI keys. Add an OpenAI-compatible LLM key only if you want the LLM to review and refine the local ranking output." />
+        <div className="mt-8 grid gap-6 xl:grid-cols-[1fr_0.9fr]">
+          <form
+            className="rounded-[24px] bg-bg p-6 neo-shadow"
+            onSubmit={(event) => {
+              event.preventDefault()
+              saveLlmSettings(settings)
+              setSaved(true)
+            }}
+          >
+            <label className="flex items-center gap-3 rounded-[20px] bg-bg p-4 font-bold neo-inset">
+              <input
+                type="checkbox"
+                checked={settings.enabled}
+                onChange={(event) => setSettings({ ...settings, enabled: event.target.checked })}
+              />
+              Enable LLM refinement after local ranking
+            </label>
+            <div className="mt-5 grid gap-5 md:grid-cols-2">
+              <label><span className="form-label">Provider label</span><input className="neo-input" value={settings.provider} onChange={(event) => setSettings({ ...settings, provider: event.target.value })} /></label>
+              <label><span className="form-label">Model</span><input className="neo-input" value={settings.model} onChange={(event) => setSettings({ ...settings, model: event.target.value })} placeholder="gpt-4o-mini" /></label>
+            </div>
+            <label className="mt-5 block"><span className="form-label">Chat completions endpoint</span><input className="neo-input" value={settings.endpoint} onChange={(event) => setSettings({ ...settings, endpoint: event.target.value })} placeholder="https://api.openai.com/v1/chat/completions" /></label>
+            <label className="mt-5 block"><span className="form-label">API key</span><input className="neo-input" type="password" value={settings.apiKey} onChange={(event) => setSettings({ ...settings, apiKey: event.target.value })} placeholder="sk-..." /></label>
+            <div className="mt-5 rounded-[20px] bg-warning/10 p-4 text-sm font-bold text-warning">
+              Frontend API keys are visible to the browser. Use this only for local demos. In production, proxy LLM calls through your backend.
+            </div>
+            <NeumorphicButton type="submit" className="mt-6"><KeyRound className="h-4 w-4" />Save LLM settings</NeumorphicButton>
+            {saved && <div className="mt-4 rounded-[20px] bg-success/10 p-4 text-sm font-bold text-success">Settings saved locally and will be used on the next ranking run.</div>}
+          </form>
+          <div className="rounded-[24px] bg-bg p-6 neo-shadow">
+            <h2 className="text-xl font-black">LLM output contract</h2>
+            <p className="mt-3 text-sm leading-6 text-muted">The LLM receives the selected JD profile, local scores, and candidate evidence. It must return JSON in this shape:</p>
+            <pre className="content-area mt-5 max-h-72 overflow-auto rounded-[20px] bg-bg p-4 text-xs leading-6 neo-inset">{`{
+  "candidates": [
+    {
+      "id": "C101",
+      "finalScore": 92,
+      "semanticScore": 95,
+      "skillScore": 88,
+      "experienceScore": 90,
+      "behaviorScore": 89,
+      "activityScore": 86,
+      "status": "Shortlisted",
+      "reason": "Why this candidate fits the selected JD"
+    }
+  ]
+}`}</pre>
+            <div className="mt-5 flex items-center gap-3 rounded-[20px] bg-bg p-4 neo-inset">
+              <Server className="h-5 w-5 text-primary" />
+              <span className="text-sm font-bold text-muted">If `VITE_API_URL` is configured, backend `/rank` is attempted first. If it fails, local + optional frontend LLM fallback is used.</span>
+            </div>
+          </div>
+        </div>
+      </PageTransition>
+    </Shell>
+  )
+}
+
 function ApplicationStepper({ steps, active }: { steps: string[]; active: number }) {
   return (
     <div className="mt-8 rounded-[24px] bg-bg p-4 neo-shadow">
@@ -1879,6 +2283,7 @@ function App() {
       <Route path="/company/upload-candidates" element={<ProtectedRoute role="company"><UploadCandidateDatasetPage /></ProtectedRoute>} />
       <Route path="/company/ranking" element={<ProtectedRoute role="company"><RankingResultPage /></ProtectedRoute>} />
       <Route path="/company/candidates/:id" element={<ProtectedRoute role="company"><CandidateDetailPage /></ProtectedRoute>} />
+      <Route path="/company/settings" element={<ProtectedRoute role="company"><CompanySettingsPage /></ProtectedRoute>} />
       <Route path="/candidate/apply" element={<CandidateApplicationPage />} />
       <Route path="/candidate/apply/:jobId" element={<CandidateApplicationPage />} />
       <Route path="/candidate/tracking" element={<ProtectedRoute role="candidate"><ApplicationTrackingPage /></ProtectedRoute>} />

@@ -26,10 +26,13 @@ TalentLens AI provides a recruiter-friendly workflow:
 - Candidate dashboard with resume upload and application tracking
 - Create job form
 - Job description upload and AI extraction preview
+- Named JD profiles saved locally for matching
+- PDF, DOCX, TXT, and pasted JD text extraction in the browser
 - Candidate dataset upload and preview
 - Data guide explaining input files vs ranked output files
 - Local AI-style ranking algorithm when no backend API is configured
 - API fallback support through `VITE_API_URL`
+- Optional frontend LLM refinement settings for local demos
 - AI ranking result table with filters
 - Candidate profile detail page with recruiter notes
 - Workday-style candidate application stepper
@@ -202,6 +205,26 @@ TalentLens AI uses two main inputs:
 - Candidate dataset: CSV or JSON containing candidate profile, skills, experience, projects, education, platform activity, and resume text.
 
 The ranked output is generated after ranking. It can be downloaded as CSV/JSON from the ranking page. A PDF report upload block is included only for attaching an already generated ranked report to a job workspace.
+
+JD workflow:
+
+1. Open `/company/upload-jd`.
+2. Enter a JD name.
+3. Paste the JD text or upload PDF/DOCX/TXT.
+4. Click **Analyze Job Description**.
+5. Review extracted skills, keywords, experience, responsibilities, soft skills, and domain requirements.
+6. Click **Save JD Profile**.
+7. Open `/company/upload-candidates`, choose that saved JD, then upload candidate CSV/JSON.
+
+Optional LLM workflow:
+
+1. Open `/company/settings`.
+2. Enable LLM refinement.
+3. Add an OpenAI-compatible chat completions endpoint, model, and API key.
+4. Run ranking. The app first produces local scores, then asks the LLM to refine scores/explanations.
+5. If the LLM request fails, the local algorithm remains the fallback.
+
+Frontend API key warning: saved keys are stored in browser storage for demo use only. Production apps should proxy LLM calls through a backend.
 
 Candidate applications are invite-link based. A company creates a job, copies the job-specific apply link, and shares it with candidates. Candidates who open `/candidate/apply/:jobId` are sent through signup/login first, then returned to that exact job application.
 
