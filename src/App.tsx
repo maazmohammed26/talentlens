@@ -126,6 +126,44 @@ type LlmSettings = {
   apiKey: string
 }
 
+type ApplicationStatus = 'Applied' | 'Under Review' | 'Shortlisted' | 'Interview' | 'Rejected' | 'Selected'
+
+type ApplicationHistoryEntry = {
+  status: ApplicationStatus
+  hrComment: string
+  updatedAt: string
+}
+
+type ApplicationRecord = {
+  id: string
+  candidateId: string
+  candidateName: string
+  candidateEmail: string
+  candidatePhone: string
+  jobId: string
+  jobTitle: string
+  appliedAt: string
+  lastAppliedAt: string
+  currentStatus: ApplicationStatus
+  hrComment: string
+  history: ApplicationHistoryEntry[]
+  repeatCount: number
+  source: 'candidate-application' | 'manual-review'
+}
+
+type CompanyProfile = {
+  companyName: string
+  recruiterName: string
+  email: string
+}
+
+type CandidateProfile = {
+  fullName: string
+  email: string
+  phone: string
+  location: string
+}
+
 const storageKeys = {
   candidates: 'talentlens:v2:candidates',
   jds: 'talentlens:v2:jds',
@@ -137,6 +175,8 @@ const storageKeys = {
   llmSettings: 'talentlens:v2:llm-settings',
   companySession: 'talentlens:v2:company-session',
   candidateSession: 'talentlens:v2:candidate-session',
+  companyProfile: 'talentlens:v2:company-profile',
+  candidateProfile: 'talentlens:v2:candidate-profile',
 }
 
 const demoAccounts = {
@@ -149,6 +189,25 @@ const demoAccounts = {
     password: 'Candidate@123',
   },
 }
+
+const demoProfiles = {
+  company: {
+    companyName: 'TalentLens Demo Company',
+    recruiterName: 'Aarav Mehta',
+    email: demoAccounts.company.email,
+  },
+  candidate: {
+    fullName: 'Riya Sharma',
+    email: demoAccounts.candidate.email,
+    phone: '+91 98765 43210',
+    location: 'Bengaluru',
+  },
+} satisfies {
+  company: CompanyProfile
+  candidate: CandidateProfile
+}
+
+const applicationStatuses: ApplicationStatus[] = ['Applied', 'Under Review', 'Shortlisted', 'Interview', 'Rejected', 'Selected']
 
 const defaultSkills = ['SQL', 'Python', 'Power BI', 'Excel', 'Dashboarding', 'Analytics']
 const knownSkills = [
@@ -253,6 +312,21 @@ function logout(role: 'company' | 'candidate') {
   localStorage.removeItem(role === 'company' ? storageKeys.companySession : storageKeys.candidateSession)
 }
 
+function loadSessionProfile(role: 'company'): CompanyProfile
+function loadSessionProfile(role: 'candidate'): CandidateProfile
+function loadSessionProfile(role: 'company' | 'candidate') {
+  const key = role === 'company' ? storageKeys.companyProfile : storageKeys.candidateProfile
+  const fallback = role === 'company' ? demoProfiles.company : demoProfiles.candidate
+  return { ...fallback, ...safeJson<Partial<CompanyProfile & CandidateProfile>>(localStorage.getItem(key), {}) }
+}
+
+function saveSessionProfile(role: 'company', profile: CompanyProfile): void
+function saveSessionProfile(role: 'candidate', profile: CandidateProfile): void
+function saveSessionProfile(role: 'company' | 'candidate', profile: CompanyProfile | CandidateProfile) {
+  const key = role === 'company' ? storageKeys.companyProfile : storageKeys.candidateProfile
+  localStorage.setItem(key, JSON.stringify(profile))
+}
+
 function fieldKey(field: string) {
   return field.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')
 }
@@ -282,6 +356,72 @@ function loadJobs() {
 function saveJobs(jobs: Job[]) {
   localStorage.setItem(storageKeys.jobs, JSON.stringify(jobs))
   window.dispatchEvent(new Event(storageKeys.jobs))
+}
+
+function normalizeApplicationStatus(value = ''): ApplicationStatus {
+  return applicationStatuses.find((status) => status.toLowerCase() === value.toLowerCase()) || 'Applied'
+}
+
+function sortApplicationsByRecent(applications: ApplicationRecord[]) {
+  return [...applications].sort((left, right) => {
+    const rightDate = Date.parse(right.lastAppliedAt || right.appliedAt || '')
+    const leftDate = Date.parse(left.lastAppliedAt || left.appliedAt || '')
+    return rightDate - leftDate
+  })
+}
+
+function loadApplications() {
+  const raw = safeJson<unknown[]>(localStorage.getItem(storageKeys.applications), [])
+  if (!raw.length) return [] as ApplicationRecord[]
+  if (typeof raw[0] === 'string') {
+    return (raw as string[]).map<ApplicationRecord>((jobTitle, index) => ({
+      id: `LEGACY-${index + 1}`,
+      candidateId: 'legacy-candidate',
+      candidateName: 'Imported candidate',
+      candidateEmail: 'legacy@example.com',
+      candidatePhone: '',
+      jobId: `legacy-job-${index + 1}`,
+      jobTitle,
+      appliedAt: new Date().toISOString(),
+      lastAppliedAt: new Date().toISOString(),
+      currentStatus: 'Applied',
+      hrComment: '',
+      history: [{ status: 'Applied', hrComment: 'Imported from a previous local version.', updatedAt: new Date().toISOString() }],
+      repeatCount: 1,
+      source: 'candidate-application',
+    }))
+  }
+  return sortApplicationsByRecent(
+    (raw as Partial<ApplicationRecord>[])
+      .filter((application) => application && typeof application === 'object')
+      .map<ApplicationRecord>((application, index) => ({
+        id: application.id || `APP-${index + 1}`,
+        candidateId: application.candidateId || application.candidateEmail || `candidate-${index + 1}`,
+        candidateName: application.candidateName || 'Candidate',
+        candidateEmail: application.candidateEmail || '',
+        candidatePhone: application.candidatePhone || '',
+        jobId: application.jobId || `job-${index + 1}`,
+        jobTitle: application.jobTitle || 'Untitled role',
+        appliedAt: application.appliedAt || application.lastAppliedAt || new Date().toISOString(),
+        lastAppliedAt: application.lastAppliedAt || application.appliedAt || new Date().toISOString(),
+        currentStatus: normalizeApplicationStatus(application.currentStatus),
+        hrComment: application.hrComment || '',
+        history: Array.isArray(application.history)
+          ? application.history.map<ApplicationHistoryEntry>((entry) => ({
+              status: normalizeApplicationStatus(entry?.status),
+              hrComment: entry?.hrComment || '',
+              updatedAt: entry?.updatedAt || application.lastAppliedAt || application.appliedAt || new Date().toISOString(),
+            }))
+          : [],
+        repeatCount: Number(application.repeatCount || 1),
+        source: application.source === 'manual-review' ? 'manual-review' : 'candidate-application',
+      })),
+  )
+}
+
+function saveApplications(applications: ApplicationRecord[]) {
+  localStorage.setItem(storageKeys.applications, JSON.stringify(sortApplicationsByRecent(applications)))
+  window.dispatchEvent(new Event(storageKeys.applications))
 }
 
 function loadLlmSettings() {
@@ -467,6 +607,111 @@ function useStoredJds() {
     }
   }, [])
   return jds
+}
+
+function useStoredApplications() {
+  const [applications, setApplications] = useState<ApplicationRecord[]>(() => loadApplications())
+  useEffect(() => {
+    const sync = () => setApplications(loadApplications())
+    window.addEventListener(storageKeys.applications, sync)
+    window.addEventListener('storage', sync)
+    return () => {
+      window.removeEventListener(storageKeys.applications, sync)
+      window.removeEventListener('storage', sync)
+    }
+  }, [])
+  return applications
+}
+
+function matchCandidateToApplication(candidate: Pick<Candidate, 'id' | 'email'>, application: ApplicationRecord) {
+  return (
+    (!!candidate.email && !!application.candidateEmail && candidate.email.toLowerCase() === application.candidateEmail.toLowerCase()) ||
+    (!!candidate.id && !!application.candidateId && candidate.id.toLowerCase() === application.candidateId.toLowerCase())
+  )
+}
+
+function getCandidateApplications(candidate: Pick<Candidate, 'id' | 'email'>, applications: ApplicationRecord[]) {
+  return sortApplicationsByRecent(applications.filter((application) => matchCandidateToApplication(candidate, application)))
+}
+
+function getCandidateApplicationSnapshot(candidate: Pick<Candidate, 'id' | 'email'>, applications: ApplicationRecord[]) {
+  const matches = getCandidateApplications(candidate, applications)
+  const current = matches[0]
+  const previous = matches[1]
+  return {
+    matches,
+    current,
+    previous,
+    totalApplications: matches.length,
+    isRepeated: matches.length > 1,
+  }
+}
+
+function formatDate(value?: string) {
+  if (!value) return 'Not available'
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return 'Not available'
+  return new Intl.DateTimeFormat('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }).format(parsed)
+}
+
+function syncCandidateStatus(candidateId: string, candidateEmail: string, status: string) {
+  const updated = loadCandidates().map((candidate) =>
+    candidate.id === candidateId || candidate.email.toLowerCase() === candidateEmail.toLowerCase()
+      ? { ...candidate, status }
+      : candidate,
+  )
+  saveCandidates(updated)
+}
+
+function saveCandidateReview(candidate: Candidate, status: ApplicationStatus, hrComment: string) {
+  const applications = loadApplications()
+  const matches = getCandidateApplications(candidate, applications)
+  const latest = matches[0]
+  const now = new Date().toISOString()
+  const comment = hrComment.trim()
+  const historyEntry: ApplicationHistoryEntry = {
+    status,
+    hrComment: comment || (status === 'Rejected' ? 'Candidate marked as rejected by recruiter.' : 'Candidate review updated by recruiter.'),
+    updatedAt: now,
+  }
+
+  let nextApplications: ApplicationRecord[]
+  if (latest) {
+    nextApplications = applications.map<ApplicationRecord>((application) =>
+      application.id === latest.id
+        ? {
+            ...application,
+            currentStatus: status,
+            hrComment: comment,
+            history: [...application.history, historyEntry],
+          }
+        : application,
+    )
+  } else {
+    const fallbackJob = getActiveJob()
+    nextApplications = [
+      {
+        id: `APP-${Date.now()}`,
+        candidateId: candidate.id,
+        candidateName: candidate.name,
+        candidateEmail: candidate.email,
+        candidatePhone: '',
+        jobId: fallbackJob?.id || `manual-${candidate.id}`,
+        jobTitle: fallbackJob?.title || getActiveRoleProfile().title,
+        appliedAt: now,
+        lastAppliedAt: now,
+        currentStatus: status,
+        hrComment: comment,
+        history: [historyEntry],
+        repeatCount: 1,
+        source: 'manual-review',
+      } satisfies ApplicationRecord,
+      ...applications,
+    ]
+  }
+
+  saveApplications(nextApplications)
+  syncCandidateStatus(candidate.id, candidate.email, status)
 }
 
 function downloadFile(filename: string, text: string, type = 'text/csv') {
@@ -1011,6 +1256,26 @@ function AuthCard({ type }: { type: 'company-login' | 'company-signup' | 'candid
                 setError(`Use demo credentials: ${demo.email} / ${demo.password}`)
                 return
               }
+              if (isCompany) {
+                const companyProfile: CompanyProfile = isSignup
+                  ? {
+                      companyName: String(form.get('company_name') || 'TalentLens company'),
+                      recruiterName: String(form.get('recruiter_name') || 'Recruiter'),
+                      email,
+                    }
+                  : demoProfiles.company
+                saveSessionProfile('company', companyProfile)
+              } else {
+                const candidateProfile: CandidateProfile = isSignup
+                  ? {
+                      fullName: String(form.get('full_name') || 'Candidate'),
+                      email,
+                      phone: String(form.get('phone') || ''),
+                      location: '',
+                    }
+                  : demoProfiles.candidate
+                saveSessionProfile('candidate', candidateProfile)
+              }
               setError('')
               if (!isCompany) {
                 setLoggedIn('candidate')
@@ -1113,42 +1378,63 @@ function ScoreBadge({ score }: { score: number }) {
   return <span className={cx('rounded-full px-3 py-1 text-xs font-black', score >= 85 ? 'bg-success/10 text-success' : score >= 72 ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>{score}</span>
 }
 
-function CandidateTable({ candidates }: { candidates: Candidate[] }) {
+function CandidateTable({ candidates, applications = [] }: { candidates: Candidate[]; applications?: ApplicationRecord[] }) {
   if (candidates.length === 0) {
     return <EmptyState title="No uploaded candidates yet" copy="Upload a CSV or JSON candidate dataset to populate this table." action="/company/upload-candidates" actionLabel="Upload candidates" />
   }
   return (
     <div className="overflow-hidden rounded-[24px] bg-bg neo-shadow">
       <div className="content-area overflow-x-auto">
-        <table className="w-full min-w-[920px] text-left text-sm">
+        <table className="w-full min-w-[1180px] text-left text-sm">
           <thead className="bg-bg text-xs uppercase text-muted">
             <tr>
-              {['Rank', 'Candidate Name', 'Final Score', 'Semantic', 'Skill', 'Experience', 'Behavioral', 'Status', 'Details'].map((h) => (
+              {['Rank', 'Candidate Name', 'Final Score', 'Semantic', 'Skill', 'Experience', 'Behavioral', 'Status', 'Application Trail', 'Details'].map((h) => (
                 <th className="px-4 py-4" key={h}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {candidates.map((candidate) => (
-              <tr className="border-t border-[#d8d7e2]" key={candidate.id}>
-                <td className="px-4 py-4 font-black">#{candidate.rank}</td>
-                <td className="px-4 py-4">
-                  <div className="font-black">{candidate.name}</div>
-                  <div className="text-xs text-muted">{candidate.email}</div>
-                </td>
-                <td className="px-4 py-4"><ScoreBadge score={candidate.finalScore} /></td>
-                <td className="px-4 py-4">{candidate.semanticScore}</td>
-                <td className="px-4 py-4">{candidate.skillScore}</td>
-                <td className="px-4 py-4">{candidate.experienceScore}</td>
-                <td className="px-4 py-4">{candidate.behaviorScore}</td>
-                <td className="px-4 py-4"><span className="rounded-full bg-primary/10 px-3 py-1 text-xs font-black text-primary">{candidate.status}</span></td>
-                <td className="px-4 py-4">
-                  <Link className="inline-flex items-center gap-1 font-black text-primary" to={`/company/candidates/${candidate.id}`}>
-                    Open <ChevronRight className="h-4 w-4" />
-                  </Link>
-                </td>
-              </tr>
-            ))}
+            {candidates.map((candidate) => {
+              const application = getCandidateApplicationSnapshot(candidate, applications)
+              const currentStatus = application.current?.currentStatus || candidate.status
+              return (
+                <tr className="border-t border-[#d8d7e2]" key={candidate.id}>
+                  <td className="px-4 py-4 font-black">#{candidate.rank}</td>
+                  <td className="px-4 py-4">
+                    <div className="font-black">{candidate.name}</div>
+                    <div className="text-xs text-muted">{candidate.email}</div>
+                  </td>
+                  <td className="px-4 py-4"><ScoreBadge score={candidate.finalScore} /></td>
+                  <td className="px-4 py-4">{candidate.semanticScore}</td>
+                  <td className="px-4 py-4">{candidate.skillScore}</td>
+                  <td className="px-4 py-4">{candidate.experienceScore}</td>
+                  <td className="px-4 py-4">{candidate.behaviorScore}</td>
+                  <td className="px-4 py-4">
+                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', currentStatus === 'Shortlisted' || currentStatus === 'Selected' ? 'bg-success/10 text-success' : currentStatus === 'Rejected' ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
+                      {currentStatus}
+                    </span>
+                    {application.current?.hrComment && <div className="mt-2 max-w-[220px] text-xs leading-5 text-muted">{application.current.hrComment}</div>}
+                  </td>
+                  <td className="px-4 py-4">
+                    {application.current ? (
+                      <div className="max-w-[240px] space-y-2 text-xs text-muted">
+                        <div className="font-bold text-text">{application.current.jobTitle}</div>
+                        <div>Last applied: {formatDate(application.current.lastAppliedAt)}</div>
+                        {application.isRepeated && <span className="inline-flex rounded-full bg-warning/10 px-3 py-1 font-black text-warning">Repeated x{application.totalApplications}</span>}
+                        {application.previous && <div>Previous: {application.previous.currentStatus} on {formatDate(application.previous.lastAppliedAt)}</div>}
+                      </div>
+                    ) : (
+                      <span className="text-xs text-muted">No applications yet</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-4">
+                    <Link className="inline-flex items-center gap-1 font-black text-primary" to={`/company/candidates/${candidate.id}`}>
+                      Open <ChevronRight className="h-4 w-4" />
+                    </Link>
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       </div>
@@ -1286,7 +1572,7 @@ function HeroProductMockup({ candidates }: { candidates: Candidate[] }) {
           </div>
           <span className="rounded-full bg-success/10 px-4 py-2 text-sm font-black text-success">{hasCandidates ? 'Ranking ready' : 'Awaiting upload'}</span>
         </div>
-        <div className="mt-6 h-56">
+        <div className="mt-6 h-56 min-w-0">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={dashboardTrend}>
               <CartesianGrid stroke="#d8d7e2" strokeDasharray="4 4" />
@@ -1520,12 +1806,15 @@ function MarketingPageHeader({ eyebrow, title, copy }: { eyebrow: string; title:
 function CompanyDashboard() {
   const candidates = useStoredCandidates()
   const jobs = useStoredJobs()
-  const shortlisted = candidates.filter((candidate) => candidate.status === 'Shortlisted').length
+  const applications = useStoredApplications()
+  const companyProfile = loadSessionProfile('company')
+  const shortlisted = applications.filter((application) => application.currentStatus === 'Shortlisted' || application.currentStatus === 'Selected').length || candidates.filter((candidate) => candidate.status === 'Shortlisted').length
+  const repeatedApplicants = new Set(applications.filter((application) => application.repeatCount > 1).map((application) => application.candidateEmail.toLowerCase())).size
   return (
     <Shell role="company">
       <PageTransition>
         <div className="flex flex-wrap items-center justify-between gap-4">
-          <SectionTitle eyebrow="Company dashboard" title="Hiring workspace" copy="Create roles, upload candidate data, and rank only the candidates you import." />
+          <SectionTitle eyebrow="Company dashboard" title={`Hiring workspace${companyProfile.recruiterName ? `, ${companyProfile.recruiterName}` : ''}`} copy="Create roles, upload candidate data, review applications, and keep recruiter comments attached to each candidate." />
           <div className="flex flex-wrap gap-3">
             <NeumorphicButton to="/company/create-job"><BriefcaseBusiness className="h-4 w-4" />Create Job</NeumorphicButton>
             <NeumorphicButton to="/company/upload-candidates" variant="soft"><Upload className="h-4 w-4" />Upload Candidates</NeumorphicButton>
@@ -1536,13 +1825,13 @@ function CompanyDashboard() {
           <DashboardCard title="Total jobs" value={String(jobs.length)} icon={BriefcaseBusiness} />
           <DashboardCard title="Uploaded candidates" value={String(candidates.length)} icon={Users} />
           <DashboardCard title="Shortlisted" value={String(shortlisted)} icon={UserCheck} tone="success" />
-          <DashboardCard title="Ranking status" value={candidates.length ? 'Ready' : 'Empty'} icon={Gauge} tone={candidates.length ? 'success' : 'warning'} />
+          <DashboardCard title="Repeated applicants" value={String(repeatedApplicants)} icon={ClipboardCheck} tone={repeatedApplicants ? 'warning' : 'primary'} />
         </div>
         <div className="mt-8 grid gap-6 xl:grid-cols-[1.25fr_0.75fr]">
           <div className="rounded-[24px] bg-bg p-5 neo-shadow">
             <h2 className="text-xl font-black">Hiring activity</h2>
             {candidates.length ? (
-              <div className="mt-4 h-72">
+              <div className="mt-4 h-72 min-w-0">
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={dashboardTrend.map((item, index) => ({ ...item, candidates: Math.round((candidates.length / 5) * (index + 1)), jobs: jobs.length }))}>
                     <CartesianGrid stroke="#d8d7e2" strokeDasharray="4 4" />
@@ -1564,9 +1853,37 @@ function CompanyDashboard() {
             </div>
           </div>
         </div>
+        <div className="mt-8 rounded-[24px] bg-bg p-5 neo-shadow">
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-xl font-black">Live application status</h2>
+            <span className="text-sm font-bold text-muted">{applications.length} tracked applications</span>
+          </div>
+          <div className="mt-4 grid gap-4 lg:grid-cols-2">
+            {applications.length ? sortApplicationsByRecent(applications).slice(0, 6).map((application) => (
+              <div className="rounded-[20px] bg-bg p-4 neo-inset" key={application.id}>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="font-black">{application.candidateName}</div>
+                    <div className="mt-1 text-xs text-muted">{application.jobTitle}</div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', application.currentStatus === 'Shortlisted' || application.currentStatus === 'Selected' ? 'bg-success/10 text-success' : application.currentStatus === 'Rejected' ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
+                      {application.currentStatus}
+                    </span>
+                    {application.repeatCount > 1 && <span className="rounded-full bg-warning/10 px-3 py-1 text-xs font-black text-warning">Repeated x{application.repeatCount}</span>}
+                  </div>
+                </div>
+                <div className="mt-3 grid gap-2 text-xs text-muted sm:grid-cols-2">
+                  <span>Last apply: {formatDate(application.lastAppliedAt)}</span>
+                  <span>Last HR note: {application.hrComment || 'No comment yet'}</span>
+                </div>
+              </div>
+            )) : <EmptyState title="No applications yet" copy="Candidate statuses and HR comments appear here after someone applies through a shared job link." compact />}
+          </div>
+        </div>
         <div className="mt-8">
           <h2 className="mb-4 text-xl font-black">Candidate rankings</h2>
-          <CandidateTable candidates={candidates} />
+          <CandidateTable candidates={candidates} applications={applications} />
         </div>
       </PageTransition>
     </Shell>
@@ -1754,6 +2071,7 @@ function UploadJDPage() {
 function UploadCandidateDatasetPage() {
   const savedJds = useStoredJds()
   const jobs = useStoredJobs()
+  const applications = useStoredApplications()
   const [candidates, setCandidates] = useState<Candidate[]>(() => loadCandidates())
   const [reportReady, setReportReady] = useState(false)
   const [error, setError] = useState('')
@@ -1841,7 +2159,7 @@ function UploadCandidateDatasetPage() {
             </div>
             {error && <div className="mt-4 rounded-[20px] bg-warning/10 p-4 text-sm font-bold text-warning">{error}</div>}
             <div className="mt-6">
-              <CandidateTable candidates={candidates} />
+              <CandidateTable candidates={candidates} applications={applications} />
             </div>
             <NeumorphicButton className="mt-6" onClick={() => navigate('/company/ranking')} disabled={!candidates.length}>
               <PlayCircle className="h-4 w-4" />Run AI Ranking
@@ -1894,6 +2212,7 @@ function UploadCandidateDatasetPage() {
 
 function RankingResultPage() {
   const candidates = useStoredCandidates()
+  const applications = useStoredApplications()
   const activeRole = getActiveRoleProfile()
   const [running, setRunning] = useState(false)
   const [minimumScore, setMinimumScore] = useState('')
@@ -1951,7 +2270,7 @@ function RankingResultPage() {
           <NeumorphicButton variant="soft" onClick={() => downloadFile('talentlens-example-ranked-output.csv', sampleRankedOutputCsv)}><FileSpreadsheet className="h-4 w-4" />Example Output</NeumorphicButton>
         </div>
         <div className="mt-6">{running ? <LoadingRankingAnimation /> : <ProgressStepper active={candidates.length ? 6 : 1} />}</div>
-        <div className="mt-6"><CandidateTable candidates={filteredCandidates} /></div>
+        <div className="mt-6"><CandidateTable candidates={filteredCandidates} applications={applications} /></div>
       </PageTransition>
     </Shell>
   )
@@ -1960,7 +2279,14 @@ function RankingResultPage() {
 function CandidateDetailPage() {
   const { id } = useParams()
   const candidates = useStoredCandidates()
+  const applications = useStoredApplications()
   const candidate = candidates.find((c) => c.id === id)
+  const [note, setNote] = useState('')
+  const [savedMessage, setSavedMessage] = useState('')
+  const applicationSnapshot = candidate ? getCandidateApplicationSnapshot(candidate, applications) : null
+  useEffect(() => {
+    setNote(applicationSnapshot?.current?.hrComment || '')
+  }, [applicationSnapshot?.current?.id, applicationSnapshot?.current?.hrComment])
   if (!candidate) {
     return (
       <Shell role="company">
@@ -1983,6 +2309,34 @@ function CandidateDetailPage() {
                 <DashboardCard title="Skills" value={`${candidate.skillScore}`} icon={Layers3} />
                 <DashboardCard title="Behavior" value={`${candidate.behaviorScore}`} icon={Activity} />
               </div>
+              <div className="mt-5 grid gap-4 lg:grid-cols-2">
+                <div className="rounded-[20px] bg-bg p-4 neo-inset">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', applicationSnapshot?.current?.currentStatus === 'Shortlisted' || applicationSnapshot?.current?.currentStatus === 'Selected' ? 'bg-success/10 text-success' : applicationSnapshot?.current?.currentStatus === 'Rejected' ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
+                      {applicationSnapshot?.current?.currentStatus || candidate.status}
+                    </span>
+                    {applicationSnapshot?.isRepeated && <span className="rounded-full bg-warning/10 px-3 py-1 text-xs font-black text-warning">Repeated applicant x{applicationSnapshot.totalApplications}</span>}
+                  </div>
+                  <div className="mt-3 space-y-2 text-sm text-muted">
+                    <div>Latest role: {applicationSnapshot?.current?.jobTitle || 'Not applied through shared link yet'}</div>
+                    <div>Last apply date: {formatDate(applicationSnapshot?.current?.lastAppliedAt)}</div>
+                    <div>Last HR comment: {applicationSnapshot?.current?.hrComment || 'No HR comment yet'}</div>
+                  </div>
+                </div>
+                <div className="rounded-[20px] bg-bg p-4 neo-inset">
+                  <h2 className="text-sm font-black uppercase tracking-[0.14em] text-muted">Previous application</h2>
+                  {applicationSnapshot?.previous ? (
+                    <div className="mt-3 space-y-2 text-sm text-muted">
+                      <div>Role: {applicationSnapshot.previous.jobTitle}</div>
+                      <div>Status: {applicationSnapshot.previous.currentStatus}</div>
+                      <div>Applied on: {formatDate(applicationSnapshot.previous.lastAppliedAt)}</div>
+                      <div>HR comment: {applicationSnapshot.previous.hrComment || 'No comment saved'}</div>
+                    </div>
+                  ) : (
+                    <p className="mt-3 text-sm text-muted">No previous application history for this candidate yet.</p>
+                  )}
+                </div>
+              </div>
             </div>
             <div className="rounded-[24px] bg-bg p-6 neo-shadow">
               <h2 className="text-xl font-black">AI explanation</h2>
@@ -1990,12 +2344,22 @@ function CandidateDetailPage() {
             </div>
             <div className="rounded-[24px] bg-bg p-6 neo-shadow">
               <h2 className="text-xl font-black">Recruiter notes</h2>
-              <textarea className="neo-input mt-4 min-h-28" placeholder="Add evaluation notes, interview feedback, or next steps." />
+              <textarea className="neo-input mt-4 min-h-28" placeholder="Add evaluation notes, interview feedback, or next steps." value={note} onChange={(event) => setNote(event.target.value)} />
+              {savedMessage && <div className="mt-4 rounded-[20px] bg-success/10 p-4 text-sm font-bold text-success">{savedMessage}</div>}
               <div className="mt-5 flex flex-wrap gap-3">
-                <NeumorphicButton><UserCheck className="h-4 w-4" />Shortlist</NeumorphicButton>
-                <NeumorphicButton variant="soft"><X className="h-4 w-4" />Reject</NeumorphicButton>
-                <NeumorphicButton variant="soft"><Save className="h-4 w-4" />Save</NeumorphicButton>
-                <NeumorphicButton variant="soft" onClick={() => downloadFile(`${candidate.id}-profile.json`, JSON.stringify(candidate, null, 2), 'application/json')}><Download className="h-4 w-4" />Download Profile</NeumorphicButton>
+                <NeumorphicButton onClick={() => {
+                  saveCandidateReview(candidate, 'Shortlisted', note)
+                  setSavedMessage('Candidate marked as shortlisted. Dashboard status and HR note are updated.')
+                }}><UserCheck className="h-4 w-4" />Shortlist</NeumorphicButton>
+                <NeumorphicButton variant="soft" onClick={() => {
+                  saveCandidateReview(candidate, 'Rejected', note)
+                  setSavedMessage('Candidate marked as rejected. Dashboard status and HR note are updated.')
+                }}><X className="h-4 w-4" />Reject</NeumorphicButton>
+                <NeumorphicButton variant="soft" onClick={() => {
+                  saveCandidateReview(candidate, applicationSnapshot?.current?.currentStatus || 'Under Review', note)
+                  setSavedMessage('HR comment saved and visible in dashboard + tracking views.')
+                }}><Save className="h-4 w-4" />Save</NeumorphicButton>
+                <NeumorphicButton variant="soft" onClick={() => downloadFile(`${candidate.id}-profile.json`, JSON.stringify({ ...candidate, applications: applicationSnapshot?.matches || [], recruiterComment: note }, null, 2), 'application/json')}><Download className="h-4 w-4" />Download Profile</NeumorphicButton>
               </div>
             </div>
           </div>
@@ -2022,16 +2386,20 @@ function CandidateProfileCard({ candidate }: { candidate: Candidate }) {
 }
 
 function CandidateDashboard() {
-  const applications = safeJson<string[]>(localStorage.getItem(storageKeys.applications), [])
+  const profile = loadSessionProfile('candidate')
+  const applications = useStoredApplications().filter((application) => application.candidateEmail.toLowerCase() === profile.email.toLowerCase())
+  const latestApplication = sortApplicationsByRecent(applications)[0]
+  const repeatedApplications = applications.filter((application) => application.repeatCount > 1).length
+  const profileCompletion = [profile.fullName, profile.email, profile.phone, profile.location].filter(Boolean).length * 25
   return (
     <Shell role="candidate">
       <PageTransition>
-        <SectionTitle eyebrow="Candidate dashboard" title="Your application hub" copy="Manage profile completion, resume uploads, and applications created through this local app." />
+        <SectionTitle eyebrow="Candidate dashboard" title={`Your application hub, ${profile.fullName}`} copy="Track only the jobs you applied to through company-shared links, along with the latest recruiter status and comments." />
         <div className="mt-8 grid gap-5 md:grid-cols-2 xl:grid-cols-4">
-          <DashboardCard title="Profile completion" value="0%" icon={UserCheck} tone="warning" />
+          <DashboardCard title="Profile completion" value={`${profileCompletion}%`} icon={UserCheck} tone={profileCompletion === 100 ? 'success' : 'warning'} />
           <DashboardCard title="Applications" value={String(applications.length)} icon={ClipboardCheck} />
-          <DashboardCard title="Saved jobs" value="0" icon={Bookmark} tone="warning" />
-          <DashboardCard title="Current status" value={applications.length ? 'Applied' : 'Empty'} icon={Activity} />
+          <DashboardCard title="Repeated applications" value={String(repeatedApplications)} icon={Bookmark} tone={repeatedApplications ? 'warning' : 'primary'} />
+          <DashboardCard title="Current status" value={latestApplication?.currentStatus || 'Empty'} icon={Activity} tone={latestApplication ? 'success' : 'warning'} />
         </div>
         <div className="mt-8 grid gap-6 xl:grid-cols-[0.85fr_1.15fr]">
           <div className="rounded-[24px] bg-bg p-6 neo-shadow">
@@ -2039,10 +2407,45 @@ function CandidateDashboard() {
             <div className="mt-5"><FileUploadBox title="Upload latest resume" accept=".pdf,.doc,.docx" format="CV" note="Resume storage can be connected to your backend." /></div>
           </div>
           <div className="rounded-[24px] bg-bg p-6 neo-shadow">
-            <h2 className="text-xl font-black">Shared job access</h2>
+            <h2 className="text-xl font-black">Latest recruiter update</h2>
             <div className="mt-5">
-              <EmptyState title="No shared job selected" copy="Candidates can apply only from a company-provided apply link. Shared links look like /candidate/apply/J123." compact />
+              {latestApplication ? (
+                <div className="rounded-[20px] bg-bg p-5 neo-inset">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', latestApplication.currentStatus === 'Shortlisted' || latestApplication.currentStatus === 'Selected' ? 'bg-success/10 text-success' : latestApplication.currentStatus === 'Rejected' ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
+                      {latestApplication.currentStatus}
+                    </span>
+                    {latestApplication.repeatCount > 1 && <span className="rounded-full bg-warning/10 px-3 py-1 text-xs font-black text-warning">Repeated x{latestApplication.repeatCount}</span>}
+                  </div>
+                  <div className="mt-4 space-y-2 text-sm text-muted">
+                    <div>Role: {latestApplication.jobTitle}</div>
+                    <div>Last applied: {formatDate(latestApplication.lastAppliedAt)}</div>
+                    <div>HR comment: {latestApplication.hrComment || 'No recruiter comment yet'}</div>
+                  </div>
+                </div>
+              ) : (
+                <EmptyState title="No shared job selected" copy="Candidates can apply only from a company-provided apply link. Shared links look like /candidate/apply/J123." compact />
+              )}
             </div>
+          </div>
+        </div>
+        <div className="mt-8 rounded-[24px] bg-bg p-6 neo-shadow">
+          <h2 className="text-xl font-black">Recent applications</h2>
+          <div className="mt-5 grid gap-4 lg:grid-cols-2">
+            {applications.length ? sortApplicationsByRecent(applications).map((application) => (
+              <div className="rounded-[20px] bg-bg p-4 neo-inset" key={application.id}>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="font-black">{application.jobTitle}</div>
+                    <div className="mt-1 text-xs text-muted">Applied on {formatDate(application.appliedAt)}</div>
+                  </div>
+                  <span className={cx('rounded-full px-3 py-1 text-xs font-black', application.currentStatus === 'Shortlisted' || application.currentStatus === 'Selected' ? 'bg-success/10 text-success' : application.currentStatus === 'Rejected' ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
+                    {application.currentStatus}
+                  </span>
+                </div>
+                <div className="mt-3 text-sm text-muted">HR comment: {application.hrComment || 'No recruiter comment yet'}</div>
+              </div>
+            )) : <EmptyState title="No applications yet" copy="Open a company shared job link to apply and start tracking your status." compact />}
           </div>
         </div>
       </PageTransition>
@@ -2054,8 +2457,15 @@ function CandidateApplicationPage() {
   const { jobId } = useParams()
   const navigate = useNavigate()
   const jobs = useStoredJobs()
+  const candidateProfile = loadSessionProfile('candidate')
   const [step, setStep] = useState(0)
   const [selectedJob, setSelectedJob] = useState(jobId || '')
+  const [formState, setFormState] = useState(() => ({
+    fullName: candidateProfile.fullName,
+    email: candidateProfile.email,
+    phone: candidateProfile.phone,
+    location: candidateProfile.location,
+  }))
   const steps = ['Select Job', 'Personal Details', 'Upload Resume', 'Add Skills', 'Screening Questions', 'Review Application', 'Submit Application']
   const invitedJob = jobs.find((job) => job.id === jobId)
   const isCandidateSignedIn = localStorage.getItem(storageKeys.candidateSession) === 'true'
@@ -2065,8 +2475,32 @@ function CandidateApplicationPage() {
     }
   }, [invitedJob, isCandidateSignedIn, jobId, navigate])
   function submitApplication() {
-    const list = safeJson<string[]>(localStorage.getItem(storageKeys.applications), [])
-    localStorage.setItem(storageKeys.applications, JSON.stringify([invitedJob?.title || selectedJob || 'Shared job application', ...list]))
+    if (!invitedJob) return
+    const applications = loadApplications()
+    const previousApplications = sortApplicationsByRecent(applications.filter((application) => application.candidateEmail.toLowerCase() === formState.email.toLowerCase()))
+    const now = new Date().toISOString()
+    const nextApplication: ApplicationRecord = {
+      id: `APP-${Date.now()}`,
+      candidateId: formState.email.toLowerCase(),
+      candidateName: formState.fullName || 'Candidate',
+      candidateEmail: formState.email,
+      candidatePhone: formState.phone,
+      jobId: invitedJob.id,
+      jobTitle: invitedJob.title,
+      appliedAt: now,
+      lastAppliedAt: now,
+      currentStatus: 'Applied',
+      hrComment: '',
+      history: [{ status: 'Applied', hrComment: 'Application submitted by candidate.', updatedAt: now }],
+      repeatCount: previousApplications.length + 1,
+      source: 'candidate-application',
+    }
+    saveApplications([nextApplication, ...applications])
+    saveSessionProfile('candidate', { ...candidateProfile, ...formState })
+    const matchingCandidate = loadCandidates().find((candidate) => candidate.email.toLowerCase() === formState.email.toLowerCase())
+    if (matchingCandidate) {
+      syncCandidateStatus(matchingCandidate.id, matchingCandidate.email, 'Applied')
+    }
   }
   if (!jobId) {
     return (
@@ -2098,12 +2532,27 @@ function CandidateApplicationPage() {
           <h2 className="text-2xl font-black">{steps[step]}</h2>
           <div className="mt-5 grid gap-5 md:grid-cols-2">
             {step === 0 && <button className={cx('text-left rounded-[20px] outline outline-2 outline-primary')} type="button" onClick={() => setSelectedJob(invitedJob.id)}><JobCard job={invitedJob} /></button>}
-            {step === 1 && ['Full name', 'Email', 'Phone', 'Location'].map((f) => <label key={f}><span className="form-label">{f}</span><input className="neo-input" placeholder={f} /></label>)}
+            {step === 1 && [
+              ['Full name', 'fullName'],
+              ['Email', 'email'],
+              ['Phone', 'phone'],
+              ['Location', 'location'],
+            ].map(([label, key]) => (
+              <label key={key}>
+                <span className="form-label">{label}</span>
+                <input
+                  className="neo-input"
+                  placeholder={label}
+                  value={formState[key as keyof typeof formState]}
+                  onChange={(event) => setFormState({ ...formState, [key]: event.target.value })}
+                />
+              </label>
+            ))}
             {step === 2 && <div className="md:col-span-2"><FileUploadBox title="Upload resume" accept=".pdf,.doc,.docx" format="CV" /></div>}
             {step === 3 && getRoleProfile(invitedJob).requiredSkills.map((skill) => <label className="flex items-center gap-3 rounded-[20px] bg-bg p-4 neo-inset" key={skill}><input type="checkbox" />{skill}</label>)}
             {step === 4 && ['Are you authorized to work?', 'Can you join within 30 days?', 'Describe a dashboard or project you built.'].map((q) => <label className="md:col-span-2" key={q}><span className="form-label">{q}</span><textarea className="neo-input min-h-20" /></label>)}
-            {step === 5 && <EmptyState title="Review application" copy="Your details, resume, skills, and screening answers are ready for submission." />}
-            {step === 6 && <EmptyState title="Application submitted" copy="Status: Applied. Recruiters can now review your profile." />}
+            {step === 5 && <EmptyState title="Review application" copy={`You are applying as ${formState.fullName || 'Candidate'} for ${invitedJob.title}. After submission, the recruiter can update status and HR comments in the dashboard.`} />}
+            {step === 6 && <EmptyState title="Application submitted" copy={`Status: Applied. You can now track ${invitedJob.title} in your dashboard and the tracking page.`} />}
           </div>
           <div className="mt-6 flex justify-between">
             <NeumorphicButton variant="soft" onClick={() => setStep(Math.max(0, step - 1))}>Back</NeumorphicButton>
@@ -2124,23 +2573,48 @@ function CandidateApplicationPage() {
 }
 
 function ApplicationTrackingPage() {
-  const applications = safeJson<string[]>(localStorage.getItem(storageKeys.applications), [])
-  const statuses = applications.length ? ['Applied', 'Under Review', 'Shortlisted', 'Interview', 'Rejected', 'Selected'] : []
+  const candidateProfile = loadSessionProfile('candidate')
+  const applications = useStoredApplications().filter((application) => application.candidateEmail.toLowerCase() === candidateProfile.email.toLowerCase())
   return (
     <Shell role="candidate">
       <PageTransition>
         <SectionTitle eyebrow="Tracking" title="Application Tracking" copy="Monitor each application status from submission through selection." />
-        {statuses.length ? (
-          <div className="mt-8 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-            {statuses.map((status, index) => (
-              <motion.div whileHover={{ y: -4 }} className="rounded-[24px] bg-bg p-6 neo-shadow" key={status}>
-                <span className="grid h-12 w-12 place-items-center rounded-full text-primary neo-inset">{index + 1}</span>
-                <h2 className="mt-5 text-xl font-black">{status}</h2>
-                <p className="mt-2 text-sm text-muted">{applications[0]} / Updated locally</p>
+        {applications.length ? (
+          <div className="mt-8 grid gap-4 xl:grid-cols-2">
+            {sortApplicationsByRecent(applications).map((application) => (
+              <motion.div whileHover={{ y: -4 }} className="rounded-[24px] bg-bg p-6 neo-shadow" key={application.id}>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <h2 className="text-xl font-black">{application.jobTitle}</h2>
+                    <p className="mt-2 text-sm text-muted">Applied on {formatDate(application.appliedAt)}</p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={cx('rounded-full px-3 py-1 text-xs font-black', application.currentStatus === 'Shortlisted' || application.currentStatus === 'Selected' ? 'bg-success/10 text-success' : application.currentStatus === 'Rejected' ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary')}>
+                      {application.currentStatus}
+                    </span>
+                    {application.repeatCount > 1 && <span className="rounded-full bg-warning/10 px-3 py-1 text-xs font-black text-warning">Repeated x{application.repeatCount}</span>}
+                  </div>
+                </div>
+                <div className="mt-4 rounded-[20px] bg-bg p-4 neo-inset">
+                  <div className="text-sm text-muted">HR comment: {application.hrComment || 'No recruiter comment yet'}</div>
+                  <div className="mt-2 text-sm text-muted">Last updated: {formatDate(application.history[application.history.length - 1]?.updatedAt || application.lastAppliedAt)}</div>
+                </div>
+                <div className="mt-4 grid gap-3">
+                  {application.history.length ? application.history.slice().reverse().map((entry, index) => (
+                    <div className="flex gap-3 rounded-[18px] bg-bg p-3 neo-inset" key={`${application.id}-${entry.updatedAt}-${index}`}>
+                      <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-primary neo-shadow">{index + 1}</span>
+                      <div>
+                        <div className="font-black">{entry.status}</div>
+                        <div className="mt-1 text-xs text-muted">{formatDate(entry.updatedAt)}</div>
+                        <div className="mt-2 text-sm text-muted">{entry.hrComment || 'No comment recorded for this step.'}</div>
+                      </div>
+                    </div>
+                  )) : <p className="text-sm text-muted">No history recorded yet.</p>}
+                </div>
               </motion.div>
             ))}
           </div>
-        ) : <div className="mt-8"><EmptyState title="No applications yet" copy="Submit an application to start tracking status." action="/candidate/apply" actionLabel="Apply now" /></div>}
+        ) : <div className="mt-8"><EmptyState title="No applications yet" copy="Submit an application from a company shared job link to start tracking your status." action="/candidate/dashboard" actionLabel="Go to dashboard" /></div>}
       </PageTransition>
     </Shell>
   )
