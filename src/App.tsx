@@ -340,6 +340,23 @@ function saveCandidates(candidates: Candidate[]) {
   window.dispatchEvent(new Event(storageKeys.candidates))
 }
 
+function candidateKey(candidate: Pick<Candidate, 'id' | 'email'>) {
+  return (candidate.email || candidate.id).toLowerCase().trim()
+}
+
+function mergeCandidateDatasets(existing: Candidate[], incoming: Candidate[]) {
+  const merged = new Map<string, Candidate>()
+  existing.forEach((candidate) => merged.set(candidateKey(candidate), candidate))
+  incoming.forEach((candidate) => {
+    const key = candidateKey(candidate)
+    const previous = merged.get(key)
+    merged.set(key, previous ? { ...previous, ...candidate } : candidate)
+  })
+  return Array.from(merged.values())
+    .sort((left, right) => right.finalScore - left.finalScore)
+    .map((candidate, index) => ({ ...candidate, rank: index + 1 }))
+}
+
 function loadJds() {
   return safeJson<SavedJD[]>(localStorage.getItem(storageKeys.jds), [])
 }
@@ -892,6 +909,84 @@ function candidateCsv(candidates: Candidate[]) {
       )
       .join('\n')
   )
+}
+
+function wrapPdfLine(value: string, maxLength = 82) {
+  const words = value.replace(/\s+/g, ' ').trim().split(' ')
+  const lines: string[] = []
+  let current = ''
+  words.forEach((word) => {
+    const next = current ? `${current} ${word}` : word
+    if (next.length > maxLength) {
+      if (current) lines.push(current)
+      current = word
+    } else {
+      current = next
+    }
+  })
+  if (current) lines.push(current)
+  return lines
+}
+
+function escapePdfText(value: string) {
+  return value
+    .replace(/[^\x20-\x7E]/g, ' ')
+    .replace(/\\/g, '\\\\')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)')
+}
+
+function buildSimplePdf(title: string, lines: string[]) {
+  const wrappedLines = lines.flatMap((line) => wrapPdfLine(line)).slice(0, 34)
+  const content = [
+    'BT',
+    '/F1 18 Tf',
+    '50 760 Td',
+    `(${escapePdfText(title)}) Tj`,
+    '/F1 10 Tf',
+    '0 -28 Td',
+    ...wrappedLines.flatMap((line) => [`(${escapePdfText(line)}) Tj`, '0 -16 Td']),
+    'ET',
+  ].join('\n')
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    `<< /Length ${content.length} >>\nstream\n${content}\nendstream`,
+  ]
+  let pdf = '%PDF-1.4\n'
+  const offsets = [0]
+  objects.forEach((object, index) => {
+    offsets.push(pdf.length)
+    pdf += `${index + 1} 0 obj\n${object}\nendobj\n`
+  })
+  const xrefOffset = pdf.length
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`
+  offsets.slice(1).forEach((offset) => {
+    pdf += `${String(offset).padStart(10, '0')} 00000 n \n`
+  })
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`
+  return pdf
+}
+
+function rankedReportLines(candidates: Candidate[]) {
+  if (!candidates.length) {
+    return [
+      'TalentLens AI ranked output report sample.',
+      'This PDF is a recruiter-facing summary document generated after ranking.',
+      'Upload candidate CSV/JSON first, run ranking, then download the live report from the AI Ranking page.',
+    ]
+  }
+  return [
+    `Generated candidates: ${candidates.length}`,
+    `Shortlisted candidates: ${candidates.filter((candidate) => candidate.status === 'Shortlisted').length}`,
+    ...candidates.slice(0, 10).map((candidate) => `#${candidate.rank} ${candidate.name} - ${candidate.finalScore}/100 - ${candidate.status}. ${candidate.reason}`),
+  ]
+}
+
+function downloadRankedPdf(candidates: Candidate[], filename = 'talentlens-ranked-output-report.pdf') {
+  downloadFile(filename, buildSimplePdf('TalentLens AI Ranked Output Report', rankedReportLines(candidates)), 'application/pdf')
 }
 
 function candidateToRow(candidate: Candidate): Record<string, string> {
@@ -1668,10 +1763,18 @@ function DataPage() {
         <div className="rounded-[24px] bg-bg p-6 neo-shadow">
           <h2 className="text-2xl font-black">Ranked output report</h2>
           <p className="mt-2 text-sm leading-6 text-muted">
-            This matches the PDF-style block you showed. It is for an already generated ranked report, not for the original candidate dataset.
+            This PDF is a generated or attached report for sharing ranking decisions. It is different from the candidate CSV/JSON input and different from the shortlist CSV export.
           </p>
           <div className="mt-5">
-            <FileUploadBox title="Drop ranked PDF report or browse" accept=".pdf" format="PDF" note="Supports PDF reports up to 5 MB." />
+            <FileUploadBox title="Attach existing ranked PDF report" accept=".pdf" format="PDF" note="Optional archive upload. Generate fresh PDF reports from the AI Ranking page." />
+          </div>
+          <div className="mt-5 flex flex-wrap gap-3">
+            <NeumorphicButton variant="soft" onClick={() => downloadRankedPdf([], 'talentlens-sample-ranked-output-report.pdf')}>
+              <Download className="h-4 w-4" /> Download sample PDF
+            </NeumorphicButton>
+            <NeumorphicButton to="/company/ranking">
+              Generate from ranking
+            </NeumorphicButton>
           </div>
         </div>
       </section>
@@ -2002,16 +2105,28 @@ function UploadJDPage() {
   }
   function saveAnalyzedJd() {
     if (!profile) return
+    const saved = loadJds()
+    const nextName = (jdName || profile.title || 'Saved JD').trim()
+    const normalizedName = nextName.toLowerCase()
+    const normalizedText = normalizeText(jdText)
+    const duplicate = saved.find(
+      (jd) => jd.name.trim().toLowerCase() === normalizedName || normalizeText(jd.text) === normalizedText,
+    )
+    if (duplicate) {
+      setError(`This JD is already saved as "${duplicate.name}". Select that saved JD instead of saving a duplicate.`)
+      return
+    }
     const jd: SavedJD = {
       id: `JD${Date.now()}`,
-      name: jdName || profile.title || 'Saved JD',
+      name: nextName,
       fileName,
       text: jdText,
       createdAt: new Date().toISOString(),
       profile,
     }
-    saveJds([jd, ...loadJds()])
+    saveJds([jd, ...saved])
     setActiveRoleSource(`jd:${jd.id}`)
+    setError('')
   }
   return (
     <Shell role="company">
@@ -2103,8 +2218,9 @@ function UploadCandidateDatasetPage() {
         setError('No candidate rows found. Please upload a CSV/JSON file with candidate records.')
         return
       }
-      saveCandidates(parsed)
-      setCandidates(parsed)
+      const merged = mergeCandidateDatasets(loadCandidates(), parsed)
+      saveCandidates(merged)
+      setCandidates(merged)
     } catch {
       setError('Could not parse the file. Check the CSV/JSON format and try again.')
     }
@@ -2171,15 +2287,15 @@ function UploadCandidateDatasetPage() {
 
           <div className="space-y-6">
             <div className="rounded-[24px] bg-bg p-5 neo-shadow sm:p-6">
-              <h2 className="text-2xl font-black">What is the PDF/report upload?</h2>
+              <h2 className="text-2xl font-black">Ranking outputs explained</h2>
               <p className="mt-3 text-sm leading-6 text-muted">
-                The screenshot block is for a ranked output file. It is not the candidate dataset. Use it when you already have a PDF ranking report and want to attach it to this hiring project.
+                Candidate CSV/JSON is the input. Ranked results, shortlist exports, and PDF reports are outputs generated after the selected JD is matched against all uploaded candidates.
               </p>
               <div className="mt-5 grid gap-3">
                 {[
-                  ['Candidate CSV/JSON', 'Input data used by AI ranking'],
-                  ['Ranked CSV/JSON', 'Output generated by the ranking page'],
-                  ['Ranked PDF report', 'Optional archive or comparison upload'],
+                  ['Ranked results', 'All candidates with AI scores, explanations, and statuses'],
+                  ['Ranked shortlist', 'Only candidates marked Shortlisted or filtered for recruiter action'],
+                  ['Ranked PDF report', 'A human-readable report for HR managers, clients, or archives'],
                 ].map(([label, value]) => (
                   <div className="flex items-center justify-between gap-3 rounded-[20px] bg-bg p-4 neo-inset" key={label}>
                     <span className="font-black">{label}</span>
@@ -2189,19 +2305,26 @@ function UploadCandidateDatasetPage() {
               </div>
             </div>
             <div className="rounded-[24px] bg-bg p-5 neo-shadow sm:p-6">
-              <h2 className="text-2xl font-black">Ranked output report</h2>
-              <p className="mt-2 text-sm leading-6 text-muted">Optional PDF upload like your reference image. Generated CSV/JSON exports are available on the ranking page.</p>
+              <h2 className="text-2xl font-black">Attach existing PDF report</h2>
+              <p className="mt-2 text-sm leading-6 text-muted">
+                Use this only if you already have a ranked PDF report from outside TalentLens and want to keep it with this workspace. To generate a fresh report, go to AI Ranking and click Download PDF Report.
+              </p>
               <div className="mt-5">
-                <FileUploadBox title="Drop ranked PDF report or browse" accept=".pdf" format="PDF" note="Supports PDF reports up to 5 MB." onFile={() => setReportReady(true)} />
+                <FileUploadBox title="Attach ranked PDF report" accept=".pdf" format="PDF" note="Optional archive upload. This is not the candidate input file." onFile={() => setReportReady(true)} />
               </div>
               {reportReady && (
                 <div className="mt-4 rounded-[20px] bg-success/10 p-4 text-sm font-bold text-success">
-                  Ranked report attached to this job workspace.
+                  Ranked PDF report attached to this job workspace.
                 </div>
               )}
-              <NeumorphicButton className="mt-5" variant="soft" onClick={() => downloadFile('talentlens-example-ranked-output.csv', sampleRankedOutputCsv)}>
+              <div className="mt-5 flex flex-wrap gap-3">
+                <NeumorphicButton variant="soft" onClick={() => downloadRankedPdf([], 'talentlens-sample-ranked-output-report.pdf')}>
+                  <Download className="h-4 w-4" />Sample PDF report
+                </NeumorphicButton>
+                <NeumorphicButton variant="soft" onClick={() => downloadFile('talentlens-example-ranked-output.csv', sampleRankedOutputCsv)}>
                 <FileSpreadsheet className="h-4 w-4" />Download output example
-              </NeumorphicButton>
+                </NeumorphicButton>
+              </div>
             </div>
           </div>
         </div>
@@ -2256,6 +2379,18 @@ function RankingResultPage() {
             <NeumorphicButton to="/company/upload-candidates" variant="soft">Change JD</NeumorphicButton>
           </div>
         </div>
+        <div className="mt-6 grid gap-4 lg:grid-cols-3">
+          {[
+            ['Ranked results', 'The full table below: every uploaded candidate scored against the selected JD.'],
+            ['Ranked shortlist', 'The recruiter-ready subset: candidates whose status is Shortlisted after filters or review.'],
+            ['Ranked output report', 'A PDF summary generated from the same ranked results for sharing or record keeping.'],
+          ].map(([title, copy]) => (
+            <div className="rounded-[20px] bg-bg p-4 neo-inset" key={title}>
+              <div className="font-black">{title}</div>
+              <div className="mt-2 text-sm leading-6 text-muted">{copy}</div>
+            </div>
+          ))}
+        </div>
         <div className="mt-6 grid gap-4 md:grid-cols-4">
           <label><span className="form-label">Minimum score</span><input className="neo-input" placeholder="80" value={minimumScore} onChange={(event) => setMinimumScore(event.target.value)} /></label>
           <label><span className="form-label">Skills</span><input className="neo-input" placeholder="SQL, Python" value={skillFilter} onChange={(event) => setSkillFilter(event.target.value)} /></label>
@@ -2266,6 +2401,7 @@ function RankingResultPage() {
           <NeumorphicButton onClick={simulateApi} disabled={!candidates.length}><Target className="h-4 w-4" />Run Ranking</NeumorphicButton>
           <NeumorphicButton variant="soft" disabled={!filteredCandidates.length} onClick={() => downloadFile('talentlens-ranking.csv', candidateCsv(filteredCandidates))}><Download className="h-4 w-4" />Download CSV</NeumorphicButton>
           <NeumorphicButton variant="soft" disabled={!filteredCandidates.length} onClick={() => downloadFile('talentlens-ranking.json', JSON.stringify(filteredCandidates, null, 2), 'application/json')}><FileJson className="h-4 w-4" />Download JSON</NeumorphicButton>
+          <NeumorphicButton variant="soft" disabled={!filteredCandidates.length} onClick={() => downloadRankedPdf(filteredCandidates)}><FileText className="h-4 w-4" />Download PDF Report</NeumorphicButton>
           <NeumorphicButton variant="soft" disabled={!shortlisted.length} onClick={() => downloadFile('talentlens-shortlist.csv', candidateCsv(shortlisted))}><UserCheck className="h-4 w-4" />Export Shortlist</NeumorphicButton>
           <NeumorphicButton variant="soft" onClick={() => downloadFile('talentlens-example-ranked-output.csv', sampleRankedOutputCsv)}><FileSpreadsheet className="h-4 w-4" />Example Output</NeumorphicButton>
         </div>
