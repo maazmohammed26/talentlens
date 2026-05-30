@@ -763,8 +763,9 @@ function AuthCard({ type }: { type: 'company-login' | 'company-signup' | 'candid
       : ['Email', 'Password']
   return (
     <PageTransition>
-      <div className="grid min-h-screen place-items-center bg-bg p-5">
-        <div className="w-full max-w-5xl rounded-[32px] bg-bg p-5 neo-shadow md:grid md:grid-cols-[0.9fr_1.1fr] md:p-8">
+      <div className="content-area h-screen bg-bg px-4 py-6 sm:px-5 sm:py-8">
+        <div className="mx-auto flex min-h-full w-full max-w-5xl items-start justify-center md:items-center">
+        <div className="w-full rounded-[32px] bg-bg p-5 neo-shadow md:grid md:grid-cols-[0.9fr_1.1fr] md:p-8">
           <div className="rounded-[24px] bg-bg p-8 neo-inset">
             <Link to="/" className="mb-12 flex items-center gap-3">
               <Target className="h-7 w-7 text-primary" />
@@ -840,6 +841,7 @@ function AuthCard({ type }: { type: 'company-login' | 'company-signup' | 'candid
               </Link>
             </p>
           </form>
+        </div>
         </div>
       </div>
     </PageTransition>
